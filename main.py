@@ -24,14 +24,20 @@ from dataclasses import asdict
 GRID_WIDTH = 20
 GRID_HEIGHT = 20
 CELL_SIZE = 32
-WINDOW_WIDTH = GRID_WIDTH * CELL_SIZE
-WINDOW_HEIGHT = GRID_HEIGHT * CELL_SIZE
+PANEL_MARGIN = 20
+SENSOR_CELL_SIZE = 40
+SENSOR_GRID_SIZE = 3 * SENSOR_CELL_SIZE
+DEBUG_PANEL_WIDTH = 220
+
+WINDOW_WIDTH = GRID_WIDTH * CELL_SIZE + DEBUG_PANEL_WIDTH
+WINDOW_HEIGHT = max(GRID_HEIGHT * CELL_SIZE, 220)
 FPS = 12
 
 EMPTY = 0
 AGENT = 1
 FOOD1 = 2
 FOOD2 = 3
+WALL = 4
 
 FOOD_ENERGY = 20
 AGENT_MAX_ENERGY = FOOD_ENERGY
@@ -41,6 +47,7 @@ COLORS = {
     AGENT: (255, 255, 255),
     FOOD1: (0, 255, 0),
     FOOD2: (255, 0, 0),
+    WALL: (100, 100, 100),
     "GRID": (70, 70, 70),
     "BG": (15, 15, 15),
 }
@@ -193,23 +200,35 @@ class GridWorld:
 
     def get_observation(self) -> np.ndarray:
         """
-        One-hot grid representation + normalized energy.
-        Shape = (4 * width * height + 1,)
+        Local 3x3 vision centered on the agent, one-hot encoded over 5 tile types
+        (EMPTY, AGENT, FOOD1, FOOD2, WALL), plus normalized energy.
+        Shape = (3 * 3 * 5 + 1,) = 46
         """
-        obs = np.zeros((4, self.height, self.width), dtype=np.float32)
+        ax, ay = self.agent_pos
+        vision = np.zeros((5, 3, 3), dtype=np.float32)
 
-        for y in range(self.height):
-            for x in range(self.width):
-                tile = self.grid[y][x]
-                obs[tile, y, x] = 1.0
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                gx = ax + dx
+                gy = ay + dy
 
-        flat = obs.reshape(-1)
+                vx = dx + 1
+                vy = dy + 1
+
+                if 0 <= gx < self.width and 0 <= gy < self.height:
+                    tile = self.grid[gy][gx]
+                else:
+                    tile = WALL
+
+                vision[tile, vy, vx] = 1.0
+
+        flat = vision.reshape(-1)
         energy = np.array([self.agent_energy / float(self.max_energy)], dtype=np.float32)
         return np.concatenate([flat, energy], axis=0)
 
     @property
     def obs_size(self) -> int:
-        return 4 * self.width * self.height + 1
+        return 3 * 3 * 5 + 1
 
     @property
     def action_size(self) -> int:
@@ -236,7 +255,78 @@ class GridWorld:
             (255, 255, 255),
         )
         screen.blit(text, (10, 10))
+        self.draw_sensor_panel(screen, font)
+        
+    def get_local_vision_tiles(self):
+        """
+        Returns a 3x3 array of tile ids centered on the agent.
+        Out-of-bounds cells are WALL.
+        """
+        ax, ay = self.agent_pos
+        vision_tiles = np.zeros((3, 3), dtype=np.int32)
 
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                gx = ax + dx
+                gy = ay + dy
+
+                vx = dx + 1
+                vy = dy + 1
+
+                if 0 <= gx < self.width and 0 <= gy < self.height:
+                    tile = self.grid[gy][gx]
+                else:
+                    tile = WALL
+
+                vision_tiles[vy, vx] = tile
+
+        return vision_tiles
+
+    def draw_sensor_panel(self, screen, font):
+        panel_x = self.width * CELL_SIZE + PANEL_MARGIN
+        panel_y = PANEL_MARGIN
+
+        # Title
+        title = font.render("Agent Vision (3x3)", True, (255, 255, 255))
+        screen.blit(title, (panel_x, panel_y))
+
+        vision_tiles = self.get_local_vision_tiles()
+
+        grid_y_start = panel_y + 35
+
+        for y in range(3):
+            for x in range(3):
+                tile = int(vision_tiles[y, x])
+
+                rect = pygame.Rect(
+                    panel_x + x * SENSOR_CELL_SIZE,
+                    grid_y_start + y * SENSOR_CELL_SIZE,
+                    SENSOR_CELL_SIZE,
+                    SENSOR_CELL_SIZE,
+                )
+
+                pygame.draw.rect(screen, COLORS[tile], rect)
+                pygame.draw.rect(screen, COLORS["GRID"], rect, 2)
+
+        # Labels
+        legend_y = grid_y_start + SENSOR_GRID_SIZE + 15
+        labels = [
+            ("EMPTY", EMPTY),
+            ("AGENT", AGENT),
+            ("FOOD1", FOOD1),
+            ("FOOD2", FOOD2),
+            ("WALL", WALL),
+        ]
+
+        for i, (name, tile_id) in enumerate(labels):
+            y = legend_y + i * 24
+
+            swatch = pygame.Rect(panel_x, y, 18, 18)
+            pygame.draw.rect(screen, COLORS[tile_id], swatch)
+            pygame.draw.rect(screen, COLORS["GRID"], swatch, 1)
+
+            label = font.render(name, True, (255, 255, 255))
+            screen.blit(label, (panel_x + 28, y - 2))
 
 # ============================================================
 # Actor-Critic Network
@@ -966,7 +1056,7 @@ def main():
     # demo_direct_weight_edits(trainer)
 
     # Train PPO
-    trainer.train(render=False)
+    trainer.train(render=True)
 
     # Save model
     trainer.save("ppo_gridworld.pt")
