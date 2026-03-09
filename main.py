@@ -79,11 +79,16 @@ class PPOConfig:
     use_l2_regularization: bool = False
     l2_coefficient: float = 1e-5
 
+    # Continual backpropagation
+    use_continual_backprop: bool = False
+    cbp_decay: float = 0.99
+    cbp_reinit_fraction: float = 0.01
+    cbp_min_steps_before_reinit: int = 100
+
     # training
     total_updates: int = 300
     device: str = "cpu"
     seed: int = 1
-
 
 # ============================================================
 # Environment
@@ -257,6 +262,7 @@ class ActorCritic(nn.Module):
         layers = []
         prev = input_dim
         self.hidden_linears = nn.ModuleList()
+        self.last_hidden_activations = []
 
         for h in self.hidden_sizes:
             linear = nn.Linear(prev, h)
@@ -278,8 +284,37 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.constant_(self.value_head.bias, 0.0)
 
+    def reinitialize_neuron(self, layer_name: str, neuron_idx: int):
+        layer = self.get_named_linear_layer(layer_name)
+
+        with torch.no_grad():
+            nn.init.orthogonal_(layer.weight[neuron_idx:neuron_idx + 1], gain=math.sqrt(2))
+            layer.bias[neuron_idx] = 0.0
+
+    def zero_outgoing_to_neuron_in_next_layer(self, hidden_layer_idx: int, neuron_idx: int):
+        """
+        If hidden layer i has neuron k reinitialized, zero its outgoing weights
+        in the next linear layer to reduce disruption.
+        """
+        next_layer = None
+
+        if hidden_layer_idx + 1 < len(self.hidden_linears):
+            next_layer = self.hidden_linears[hidden_layer_idx + 1]
+        else:
+            next_layer = self.policy_head
+
+        with torch.no_grad():
+            next_layer.weight[:, neuron_idx] = 0.0
+
     def forward(self, x):
-        z = self.shared(x)
+        z = x
+        self.last_hidden_activations = []
+
+        for module in self.shared:
+            z = module(z)
+            if isinstance(module, (nn.Tanh, nn.ReLU)):
+                self.last_hidden_activations.append(z.detach())
+
         logits = self.policy_head(z)
         value = self.value_head(z).squeeze(-1)
         return logits, value
@@ -497,6 +532,88 @@ class PPOTrainer:
         self.episode_count = 0
         self.best_episode_food = -1
 
+        self.gradient_step_count = 0
+
+        # One EMA utility vector per hidden layer
+        self.hidden_utilities = []
+        for linear in self.model.hidden_linears:
+            num_units = linear.out_features
+            util = torch.zeros(num_units, dtype=torch.float32, device=self.device)
+            self.hidden_utilities.append(util)
+
+    def update_hidden_utilities(self):
+        if not self.cfg.use_continual_backprop:
+            return
+
+        if not hasattr(self.model, "last_hidden_activations"):
+            return
+
+        if len(self.model.last_hidden_activations) != len(self.hidden_utilities):
+            return
+
+        decay = self.cfg.cbp_decay
+
+        for layer_idx, acts in enumerate(self.model.last_hidden_activations):
+            # acts shape: [batch, units]
+            mean_abs = acts.abs().mean(dim=0).detach()
+            self.hidden_utilities[layer_idx] = (
+                    decay * self.hidden_utilities[layer_idx]
+                    + (1.0 - decay) * mean_abs
+            )
+
+    def maybe_apply_continual_backprop(self):
+        if not self.cfg.use_continual_backprop:
+            return
+
+        if self.gradient_step_count < self.cfg.cbp_min_steps_before_reinit:
+            return
+
+        for layer_idx, util in enumerate(self.hidden_utilities):
+            num_units = util.shape[0]
+            num_reinit = max(1, int(num_units * self.cfg.cbp_reinit_fraction))
+
+            if num_reinit <= 0:
+                continue
+
+            # Least-used units
+            _, least_used_idx = torch.topk(util, k=num_reinit, largest=False)
+
+            for idx_tensor in least_used_idx:
+                neuron_idx = int(idx_tensor.item())
+
+                # Reinitialize incoming weights + bias
+                self.model.reinitialize_neuron(f"hidden:{layer_idx}", neuron_idx)
+
+                # Zero outgoing weights into the next layer / policy head
+                self.model.zero_outgoing_to_neuron_in_next_layer(layer_idx, neuron_idx)
+
+                # Reset utility so it can compete again fairly
+                self.hidden_utilities[layer_idx][neuron_idx] = 0.0
+
+                # Clear Adam state for this neuron's incoming weights/bias
+                self._clear_optimizer_state_for_neuron(layer_idx, neuron_idx)
+
+    def _clear_optimizer_state_for_neuron(self, hidden_layer_idx: int, neuron_idx: int):
+        layer = self.model.hidden_linears[hidden_layer_idx]
+
+        # Clear optimizer state for incoming weights and bias of this neuron
+        for param, row_idx in [(layer.weight, neuron_idx), (layer.bias, neuron_idx)]:
+            state = self.optimizer.state.get(param, None)
+            if state is None:
+                continue
+
+            if "exp_avg" in state:
+                if param.ndim == 2:
+                    state["exp_avg"][row_idx].zero_()
+                else:
+                    state["exp_avg"][row_idx] = 0.0
+
+            if "exp_avg_sq" in state:
+                if param.ndim == 2:
+                    state["exp_avg_sq"][row_idx].zero_()
+                else:
+                    state["exp_avg_sq"][row_idx] = 0.0
+
     def collect_rollout(self, render=False, screen=None, clock=None, font=None, render_every=10):
         self.buffer.clear()
         obs = self.env.reset()
@@ -593,6 +710,7 @@ class PPOTrainer:
                 mb_returns = returns[mb_idx]
 
                 new_log_probs, entropy, values = self.model.evaluate_actions(mb_obs, mb_actions)
+                self.update_hidden_utilities()
 
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
                 surr1 = ratio * mb_advantages
@@ -619,6 +737,8 @@ class PPOTrainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
                 self.optimizer.step()
+                self.gradient_step_count += 1
+                self.maybe_apply_continual_backprop()
 
                 stats["policy_loss"] += float(policy_loss.item())
                 stats["value_loss"] += float(value_loss.item())
@@ -817,8 +937,12 @@ def main():
         value_coef=0.5,
         entropy_coef=0.01,
         max_grad_norm=0.5,
-        use_l2_regularization=True,   # <--- toggle this
-        l2_coefficient=1e-6,          # <--- strength of L2
+        use_l2_regularization=False,
+        l2_coefficient=1e-6,
+        use_continual_backprop=True, 
+        cbp_decay=0.99,
+        cbp_reinit_fraction=0.01,
+        cbp_min_steps_before_reinit=100,
         total_updates=300,
         device="cpu",
         seed=1,
@@ -835,6 +959,8 @@ def main():
     print("Hidden sizes:", net_cfg.hidden_sizes)
     print("L2 enabled:", ppo_cfg.use_l2_regularization)
     print("L2 coefficient:", ppo_cfg.l2_coefficient)
+    print("Continual backprop enabled:", ppo_cfg.use_continual_backprop)
+    print("CBP reinit fraction:", ppo_cfg.cbp_reinit_fraction)
 
     # Optional: direct surgery on the network before training
     # demo_direct_weight_edits(trainer)

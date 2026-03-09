@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 # ============================================================
 # Hardcoded filenames
 # ============================================================
-FILE1 = "runs/20260308_142355_episodes.csv"
-FILE2 = "runs/20260308_143010_episodes.csv"
+FILE1 = "runs/20260308_225902_episodes.csv"
+FILE2 = "runs/20260308_230542_episodes.csv"
 
 LABEL1 = "Run 1"
 LABEL2 = "Run 2"
