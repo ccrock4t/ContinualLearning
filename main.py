@@ -27,10 +27,18 @@ CELL_SIZE = 32
 PANEL_MARGIN = 20
 SENSOR_CELL_SIZE = 40
 SENSOR_GRID_SIZE = 3 * SENSOR_CELL_SIZE
-DEBUG_PANEL_WIDTH = 220
+DEBUG_PANEL_WIDTH = 260
+
+
+SMELL_BAR_MAX_HEIGHT = 80
+SMELL_BAR_WIDTH = 10
+SMELL_BAR_GAP = 4
+SMELL_EPSILON = 1e-6
+FOOD1_MASS = 1.0
+FOOD2_MASS = 1.0
 
 WINDOW_WIDTH = GRID_WIDTH * CELL_SIZE + DEBUG_PANEL_WIDTH
-WINDOW_HEIGHT = max(GRID_HEIGHT * CELL_SIZE, 220)
+WINDOW_HEIGHT = max(GRID_HEIGHT * CELL_SIZE, 520)
 FPS = 12
 
 EMPTY = 0
@@ -128,8 +136,134 @@ class GridWorld:
         self.agent_pos = (0, 0)
         self.agent_energy = self.max_energy
         self.food_eaten = 0
+        self.corner_smell_food1 = [0.0, 0.0, 0.0, 0.0]
+        self.corner_smell_food2 = [0.0, 0.0, 0.0, 0.0]
+        self.smell_max_value = 1.0
 
         self.reset()
+
+    def draw_smell_panel(self, screen, font, panel_x, panel_y):
+        """
+        Draw a smell visualization panel below the 3x3 vision panel.
+        Shows 4 bar pairs corresponding to the world corners:
+          TL, TR, BL, BR
+        Green = FOOD1 smell
+        Red   = FOOD2 smell
+        """
+        title = font.render("Corner Smell", True, (255, 255, 255))
+        screen.blit(title, (panel_x, panel_y))
+
+        labels = ["TL", "TR", "BL", "BR"]
+
+        chart_top = panel_y + 35
+        chart_height = 100
+        baseline_y = chart_top + chart_height
+        group_spacing = 52
+        start_x = panel_x + 8
+
+        for i, label_text in enumerate(labels):
+            smell1 = self.corner_smell_food1[i]
+            smell2 = self.corner_smell_food2[i]
+
+            h1 = int((smell1 / self.smell_max_value) * SMELL_BAR_MAX_HEIGHT)
+            h2 = int((smell2 / self.smell_max_value) * SMELL_BAR_MAX_HEIGHT)
+
+            gx = start_x + i * group_spacing
+
+            rect1 = pygame.Rect(gx, baseline_y - h1, SMELL_BAR_WIDTH, h1)
+            rect2 = pygame.Rect(gx + SMELL_BAR_WIDTH + SMELL_BAR_GAP, baseline_y - h2, SMELL_BAR_WIDTH, h2)
+
+            pygame.draw.rect(screen, COLORS[FOOD1], rect1)
+            pygame.draw.rect(screen, COLORS[FOOD2], rect2)
+
+            pygame.draw.rect(screen, COLORS["GRID"], rect1, 1)
+            pygame.draw.rect(screen, COLORS["GRID"], rect2, 1)
+
+            # corner label below the pair
+            label = font.render(label_text, True, (255, 255, 255))
+            screen.blit(label, (gx - 2, baseline_y + 6))
+
+        # baseline
+        pygame.draw.line(
+            screen,
+            COLORS["GRID"],
+            (start_x - 4, baseline_y),
+            (start_x + 3 * group_spacing + 30, baseline_y),
+            2
+        )
+
+        # legend
+        legend_y = baseline_y + 35
+
+        sw1 = pygame.Rect(panel_x, legend_y, 18, 18)
+        pygame.draw.rect(screen, COLORS[FOOD1], sw1)
+        pygame.draw.rect(screen, COLORS["GRID"], sw1, 1)
+        txt1 = font.render("FOOD1", True, (255, 255, 255))
+        screen.blit(txt1, (panel_x + 26, legend_y - 2))
+
+        sw2 = pygame.Rect(panel_x, legend_y + 24, 18, 18)
+        pygame.draw.rect(screen, COLORS[FOOD2], sw2)
+        pygame.draw.rect(screen, COLORS["GRID"], sw2, 1)
+        txt2 = font.render("FOOD2", True, (255, 255, 255))
+        screen.blit(txt2, (panel_x + 26, legend_y + 22))
+
+    def get_corner_positions(self):
+        """
+        Returns the 4 corners of the agent's current cell in continuous grid coordinates.
+        Order:
+          0 = top-left
+          1 = top-right
+          2 = bottom-left
+          3 = bottom-right
+        """
+        ax, ay = self.agent_pos
+        return [
+            (float(ax), float(ay)),
+            (float(ax + 1), float(ay)),
+            (float(ax), float(ay + 1)),
+            (float(ax + 1), float(ay + 1)),
+        ]
+
+    def get_cell_center(self, x: int, y: int):
+        """
+        Treat each tile as occupying [x, x+1] x [y, y+1], so its center is (x+0.5, y+0.5).
+        """
+        return (x + 0.5, y + 0.5)
+
+    def compute_smell_for_food_type(self, target_tile: int, mass: float):
+        """
+        Smell at each corner q:
+            sum( mass(cell,target_tile) / dist(cell_center, q)^2 )
+        """
+        corners = self.get_corner_positions()
+        smells = [0.0, 0.0, 0.0, 0.0]
+
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.grid[y][x] != target_tile:
+                    continue
+
+                cx, cy = self.get_cell_center(x, y)
+
+                for i, (qx, qy) in enumerate(corners):
+                    dx = cx - qx
+                    dy = cy - qy
+                    dist_sq = dx * dx + dy * dy + SMELL_EPSILON
+                    smells[i] += mass / dist_sq
+
+        return smells
+
+    def recompute_corner_smells(self):
+        self.corner_smell_food1 = self.compute_smell_for_food_type(FOOD1, FOOD1_MASS)
+        self.corner_smell_food2 = self.compute_smell_for_food_type(FOOD2, FOOD2_MASS)
+
+        max_smell = max(
+            max(self.corner_smell_food1, default=0.0),
+            max(self.corner_smell_food2, default=0.0),
+            1.0,
+        )
+        self.smell_max_value = max_smell
+
 
     def reset(self):
         self.grid = [[EMPTY for _ in range(self.width)] for _ in range(self.height)]
@@ -148,6 +282,8 @@ class GridWorld:
         for _ in range(self.num_food2):
             x, y = self._random_empty_cell()
             self.grid[y][x] = FOOD2
+
+        self.recompute_corner_smells()
 
         return self.get_observation()
 
@@ -190,6 +326,7 @@ class GridWorld:
             done = True
             reward = float(self.food_eaten)
 
+        self.recompute_corner_smells()
         obs = self.get_observation()
         info = {
             "food_eaten": self.food_eaten,
@@ -255,8 +392,9 @@ class GridWorld:
             (255, 255, 255),
         )
         screen.blit(text, (10, 10))
+
         self.draw_sensor_panel(screen, font)
-        
+
     def get_local_vision_tiles(self):
         """
         Returns a 3x3 array of tile ids centered on the agent.
@@ -328,6 +466,8 @@ class GridWorld:
             label = font.render(name, True, (255, 255, 255))
             screen.blit(label, (panel_x + 28, y - 2))
 
+        smell_panel_y = legend_y + len(labels) * 24 + 30
+        self.draw_smell_panel(screen, font, panel_x, smell_panel_y)
 # ============================================================
 # Actor-Critic Network
 # ============================================================
