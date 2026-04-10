@@ -21,8 +21,8 @@ from dataclasses import asdict
 # Config
 # ============================================================
 
-GRID_WIDTH = 20
-GRID_HEIGHT = 20
+GRID_WIDTH = 30
+GRID_HEIGHT = 30
 CELL_SIZE = 32
 PANEL_MARGIN = 20
 SENSOR_CELL_SIZE = 40
@@ -47,8 +47,15 @@ FOOD1 = 2
 FOOD2 = 3
 WALL = 4
 
-FOOD_ENERGY = 20
-AGENT_MAX_ENERGY = FOOD_ENERGY
+# ============================================================
+# Continual-learning methodology config
+# ============================================================
+
+GLOBAL_ENERGY_E = 20.0
+NUM_TRAIN_WORLDS = 10
+TRAIN_WORLD_SEED = 123
+
+
 
 COLORS = {
     EMPTY: (30, 30, 30),
@@ -62,13 +69,29 @@ COLORS = {
 
 
 @dataclass
+class WorldSpec:
+    width: int
+    height: int
+    agent_start: Tuple[int, int]
+    food1_positions: List[Tuple[int, int]]
+    food2_positions: List[Tuple[int, int]]
+    food1_energy: float
+    food2_energy: float
+    epsilon1: float = 1.0
+    epsilon2: float = 1.0
+    world_id: int = -1
+    randomize_agent_start: bool = False
+@dataclass
 class EnvConfig:
-    width: int = 20
-    height: int = 20
-    num_food1: int = 20
-    num_food2: int = 12
-    max_energy: int = AGENT_MAX_ENERGY
-    food_energy: int = FOOD_ENERGY
+    width: int = 40
+    height: int = 40
+    num_food1: int = 30
+    num_food2: int = 30
+    food1_energy: int = 20
+    food2_energy: int = 20
+    episode_horizon: int = 100
+
+
 
 
 @dataclass
@@ -79,9 +102,13 @@ class NetworkConfig:
 
 @dataclass
 class PPOConfig:
-    rollout_steps: int = 2048
+    total_env_steps_target: int = 1_000_000
+
+    # PPO collection/update cadence
+    steps_per_update: int = 2048
     ppo_epochs: int = 10
     minibatch_size: int = 256
+
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
@@ -90,31 +117,110 @@ class PPOConfig:
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
 
-    # L2 regularization
-    use_l2_regularization: bool = False
-    l2_coefficient: float = 1e-5
+    # Continual-learning schedule
+    steps_per_world: int = 20_000
 
-    # Continual backpropagation
+    use_l2_regularization: bool = False
+    l2_coefficient: float = 1e-4
+
     use_continual_backprop: bool = False
     cbp_decay: float = 0.99
-    cbp_reinit_fraction: float = 0.01
-    cbp_min_steps_before_reinit: int = 100
+    cbp_reinit_fraction: float = 1e-4
+    cbp_min_steps_before_reinit: int = 0
 
-    # training
-    total_updates: int = 300
     device: str = "cpu"
     seed: int = 1
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
 
 # ============================================================
 # Environment
 # ============================================================
+def generate_world_spec(
+    cfg: EnvConfig,
+    rng: random.Random,
+    food1_energy: float,
+    food2_energy: float,
+    epsilon1: float = 1.0,
+    epsilon2: float = 1.0,
+    world_id: int = -1,
+) -> WorldSpec:
+    occupied = set()
+
+    def random_empty():
+        while True:
+            x = rng.randrange(cfg.width)
+            y = rng.randrange(cfg.height)
+            if (x, y) not in occupied:
+                occupied.add((x, y))
+                return (x, y)
+
+    agent_start = random_empty()
+    food1_positions = [random_empty() for _ in range(cfg.num_food1)]
+    food2_positions = [random_empty() for _ in range(cfg.num_food2)]
+
+    return WorldSpec(
+        width=cfg.width,
+        height=cfg.height,
+        agent_start=agent_start,
+        food1_positions=food1_positions,
+        food2_positions=food2_positions,
+        food1_energy=float(food1_energy),
+        food2_energy=float(food2_energy),
+        epsilon1=float(epsilon1),
+        epsilon2=float(epsilon2),
+        world_id=world_id,
+    )
+
+def generate_base_world(cfg: EnvConfig, seed: int) -> WorldSpec:
+    rng = random.Random(seed)
+    return generate_world_spec(
+        cfg=cfg,
+        rng=rng,
+        food1_energy=0.0,   # placeholder, will be overwritten per phase
+        food2_energy=0.0,
+        epsilon1=1.0,
+        epsilon2=1.0,
+        world_id=0,
+    )
+
+
+def generate_training_worlds(
+    cfg: EnvConfig,
+    num_worlds: int,
+    E: float,
+    seed: int,
+) -> List[WorldSpec]:
+    base = generate_base_world(cfg, seed)
+    worlds = []
+
+    for i in range(num_worlds):
+        if i % 2 == 0:
+            food1_energy = +E
+            food2_energy = -E
+        else:
+            food1_energy = -E
+            food2_energy = +E
+
+        worlds.append(
+            WorldSpec(
+                width=base.width,
+                height=base.height,
+                agent_start=base.agent_start,
+                food1_positions=list(base.food1_positions),
+                food2_positions=list(base.food2_positions),
+                food1_energy=float(food1_energy),
+                food2_energy=float(food2_energy),
+                epsilon1=base.epsilon1,
+                epsilon2=base.epsilon2,
+                world_id=i,
+            )
+        )
+
+    return worlds
+
 
 class GridWorld:
-    """
-    PPO-controlled grid world.
-    Reward is 0 on all intermediate steps.
-    At episode end (energy <= 0), reward = total number of food eaten in the episode.
-    """
 
     ACTIONS = [
         (0, -1),   # up
@@ -123,24 +229,70 @@ class GridWorld:
         (1, 0),    # right
     ]
 
-    def __init__(self, cfg: EnvConfig):
+    def __init__(self, cfg: EnvConfig, seed: int = 0):
         self.cfg = cfg
         self.width = cfg.width
         self.height = cfg.height
         self.num_food1 = cfg.num_food1
         self.num_food2 = cfg.num_food2
-        self.max_energy = cfg.max_energy
-        self.food_energy = cfg.food_energy
+        self.food1_energy = cfg.food1_energy
+        self.food2_energy = cfg.food2_energy
+        self.episode_horizon = cfg.episode_horizon
 
         self.grid = [[EMPTY for _ in range(self.width)] for _ in range(self.height)]
         self.agent_pos = (0, 0)
-        self.agent_energy = self.max_energy
         self.food_eaten = 0
+        self.episode_return = 0.0
         self.corner_smell_food1 = [0.0, 0.0, 0.0, 0.0]
         self.corner_smell_food2 = [0.0, 0.0, 0.0, 0.0]
         self.smell_max_value = 1.0
 
+        self.rng = random.Random(seed)
         self.reset()
+
+    def _random_empty_cell(self):
+        while True:
+            x = self.rng.randrange(self.width)
+            y = self.rng.randrange(self.height)
+            if self.grid[y][x] == EMPTY:
+                return x, y
+
+    def _respawn_food(self, food_tile: int):
+        x, y = self._random_empty_cell()
+        self.grid[y][x] = food_tile
+
+    def load_world(self, world_spec: WorldSpec):
+        self.width = world_spec.width
+        self.height = world_spec.height
+        self.food1_energy = float(world_spec.food1_energy)
+        self.food2_energy = float(world_spec.food2_energy)
+
+        self.grid = [[EMPTY for _ in range(self.width)] for _ in range(self.height)]
+        self.food_eaten = 0
+        self.steps_alive = 0
+        self.episode_return = 0.0
+
+        for x, y in world_spec.food1_positions:
+            self.grid[y][x] = FOOD1
+
+        for x, y in world_spec.food2_positions:
+            self.grid[y][x] = FOOD2
+
+        if world_spec.randomize_agent_start:
+            occupied = set(world_spec.food1_positions) | set(world_spec.food2_positions)
+            while True:
+                ax = self.rng.randrange(self.width)
+                ay = self.rng.randrange(self.height)
+                if (ax, ay) not in occupied:
+                    break
+        else:
+            ax, ay = world_spec.agent_start
+
+        self.agent_pos = (ax, ay)
+        self.grid[ay][ax] = AGENT
+
+        self.recompute_corner_smells()
+        return self.get_observation()
 
     def draw_smell_panel(self, screen, font, panel_x, panel_y):
         """
@@ -264,12 +416,14 @@ class GridWorld:
         )
         self.smell_max_value = max_smell
 
+    def reset(self, world_spec: Optional[WorldSpec] = None):
+        if world_spec is not None:
+            return self.load_world(world_spec)
 
-    def reset(self):
         self.grid = [[EMPTY for _ in range(self.width)] for _ in range(self.height)]
-        self.agent_energy = self.max_energy
         self.food_eaten = 0
         self.steps_alive = 0
+        self.episode_return = 0.0
 
         self.agent_pos = self._random_empty_cell()
         ax, ay = self.agent_pos
@@ -284,15 +438,7 @@ class GridWorld:
             self.grid[y][x] = FOOD2
 
         self.recompute_corner_smells()
-
         return self.get_observation()
-
-    def _random_empty_cell(self):
-        while True:
-            x = random.randrange(self.width)
-            y = random.randrange(self.height)
-            if self.grid[y][x] == EMPTY:
-                return x, y
 
     def step(self, action: int):
         dx, dy = self.ACTIONS[action]
@@ -300,47 +446,52 @@ class GridWorld:
         nx = ax + dx
         ny = ay + dy
 
-        reward = 0.0
         done = False
 
-        # Lose 1 energy every step
-        self.agent_energy -= 1
-
-        # add steps alive
         self.steps_alive += 1
+        reward = 0.0
 
-        # Move only if in bounds
         if 0 <= nx < self.width and 0 <= ny < self.height:
             target_tile = self.grid[ny][nx]
 
-            if target_tile in (FOOD1, FOOD2):
+            ate_food1 = False
+            ate_food2 = False
+
+            if target_tile == FOOD1:
                 self.food_eaten += 1
-                self.agent_energy = self.max_energy
+                delta = self.food1_energy
+                reward += delta
+                ate_food1 = True
+
+            elif target_tile == FOOD2:
+                self.food_eaten += 1
+                delta = self.food2_energy
+                reward += delta
+                ate_food2 = True
 
             self.grid[ay][ax] = EMPTY
             self.agent_pos = (nx, ny)
             self.grid[ny][nx] = AGENT
 
-        # Episode ends when energy runs out
-        if self.agent_energy <= 0:
-            done = True
-            reward = float(self.food_eaten)
+            if ate_food1:
+                self._respawn_food(FOOD1)
+            elif ate_food2:
+                self._respawn_food(FOOD2)
+
+        done = self.steps_alive >= self.episode_horizon
+
+        self.episode_return += reward
 
         self.recompute_corner_smells()
         obs = self.get_observation()
         info = {
             "food_eaten": self.food_eaten,
-            "energy": self.agent_energy,
             "steps_alive": self.steps_alive,
+            "episode_return": self.episode_return,
         }
         return obs, reward, done, info
 
     def get_observation(self) -> np.ndarray:
-        """
-        Local 3x3 vision centered on the agent, one-hot encoded over 5 tile types
-        (EMPTY, AGENT, FOOD1, FOOD2, WALL), plus normalized energy.
-        Shape = (3 * 3 * 5 + 1,) = 46
-        """
         ax, ay = self.agent_pos
         vision = np.zeros((5, 3, 3), dtype=np.float32)
 
@@ -360,12 +511,18 @@ class GridWorld:
                 vision[tile, vy, vx] = 1.0
 
         flat = vision.reshape(-1)
-        energy = np.array([self.agent_energy / float(self.max_energy)], dtype=np.float32)
-        return np.concatenate([flat, energy], axis=0)
+
+        smell = np.array(
+            self.corner_smell_food1 + self.corner_smell_food2,
+            dtype=np.float32
+        )
+        smell = smell / max(self.smell_max_value, 1e-6)
+
+        return np.concatenate([flat, smell], axis=0)
 
     @property
     def obs_size(self) -> int:
-        return 3 * 3 * 5 + 1
+        return 3 * 3 * 5 + 8
 
     @property
     def action_size(self) -> int:
@@ -387,10 +544,12 @@ class GridWorld:
                 pygame.draw.rect(screen, COLORS["GRID"], rect, 1)
 
         text = font.render(
-            f"Energy: {self.agent_energy}/{self.max_energy}  Food eaten: {self.food_eaten}",
+            f"Food eaten: {self.food_eaten}  "
+            f"F1: {self.food1_energy}  F2: {self.food2_energy}",
             True,
             (255, 255, 255),
         )
+
         screen.blit(text, (10, 10))
 
         self.draw_sensor_panel(screen, font)
@@ -522,19 +681,13 @@ class ActorCritic(nn.Module):
             layer.bias[neuron_idx] = 0.0
 
     def zero_outgoing_to_neuron_in_next_layer(self, hidden_layer_idx: int, neuron_idx: int):
-        """
-        If hidden layer i has neuron k reinitialized, zero its outgoing weights
-        in the next linear layer to reduce disruption.
-        """
-        next_layer = None
-
-        if hidden_layer_idx + 1 < len(self.hidden_linears):
-            next_layer = self.hidden_linears[hidden_layer_idx + 1]
-        else:
-            next_layer = self.policy_head
-
         with torch.no_grad():
-            next_layer.weight[:, neuron_idx] = 0.0
+            if hidden_layer_idx + 1 < len(self.hidden_linears):
+                next_layer = self.hidden_linears[hidden_layer_idx + 1]
+                next_layer.weight[:, neuron_idx] = 0.0
+            else:
+                self.policy_head.weight[:, neuron_idx] = 0.0
+                self.value_head.weight[:, neuron_idx] = 0.0
 
     def forward(self, x):
         z = x
@@ -548,6 +701,9 @@ class ActorCritic(nn.Module):
         logits = self.policy_head(z)
         value = self.value_head(z).squeeze(-1)
         return logits, value
+
+
+
 
     def act(self, obs: torch.Tensor):
         logits, value = self.forward(obs)
@@ -567,9 +723,6 @@ class ActorCritic(nn.Module):
     # Direct inspection / editing API
     # ----------------------------
 
-    def get_hidden_layer(self, layer_idx: int) -> nn.Linear:
-        return self.hidden_linears[layer_idx]
-
     def get_named_linear_layer(self, name: str) -> nn.Linear:
         if name == "policy":
             return self.policy_head
@@ -579,66 +732,6 @@ class ActorCritic(nn.Module):
             idx = int(name.split(":")[1])
             return self.hidden_linears[idx]
         raise ValueError(f"Unknown layer name: {name}")
-
-    def get_weight(self, layer_name: str, out_idx: int, in_idx: int) -> float:
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            return float(layer.weight[out_idx, in_idx].item())
-
-    def set_weight(self, layer_name: str, out_idx: int, in_idx: int, value: float):
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            layer.weight[out_idx, in_idx] = value
-
-    def add_to_weight(self, layer_name: str, out_idx: int, in_idx: int, delta: float):
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            layer.weight[out_idx, in_idx] += delta
-
-    def zero_weight(self, layer_name: str, out_idx: int, in_idx: int):
-        self.set_weight(layer_name, out_idx, in_idx, 0.0)
-
-    def get_bias(self, layer_name: str, neuron_idx: int) -> float:
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            return float(layer.bias[neuron_idx].item())
-
-    def set_bias(self, layer_name: str, neuron_idx: int, value: float):
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            layer.bias[neuron_idx] = value
-
-    def get_neuron_weights(self, layer_name: str, neuron_idx: int) -> np.ndarray:
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            return layer.weight[neuron_idx].detach().cpu().numpy().copy()
-
-    def set_neuron_weights(self, layer_name: str, neuron_idx: int, weights: np.ndarray, bias: Optional[float] = None):
-        layer = self.get_named_linear_layer(layer_name)
-        weights = np.asarray(weights, dtype=np.float32)
-        if weights.shape[0] != layer.weight.shape[1]:
-            raise ValueError(f"Expected {layer.weight.shape[1]} incoming weights, got {weights.shape[0]}")
-        with torch.no_grad():
-            layer.weight[neuron_idx] = torch.tensor(weights, dtype=layer.weight.dtype, device=layer.weight.device)
-            if bias is not None:
-                layer.bias[neuron_idx] = bias
-
-    def zero_neuron(self, layer_name: str, neuron_idx: int):
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            layer.weight[neuron_idx].zero_()
-            layer.bias[neuron_idx] = 0.0
-
-    def scale_neuron(self, layer_name: str, neuron_idx: int, factor: float):
-        layer = self.get_named_linear_layer(layer_name)
-        with torch.no_grad():
-            layer.weight[neuron_idx] *= factor
-            layer.bias[neuron_idx] *= factor
-
-    def freeze_layer(self, layer_name: str, freeze: bool = True):
-        layer = self.get_named_linear_layer(layer_name)
-        for p in layer.parameters():
-            p.requires_grad = not freeze
 
 
 # ============================================================
@@ -695,18 +788,28 @@ class RolloutBuffer:
         self.returns = returns
 
 class RunLogger:
-    def __init__(self, env_cfg: EnvConfig, net_cfg: NetworkConfig, ppo_cfg: PPOConfig, run_dir="runs"):
+    def __init__(
+        self,
+        env_cfg: EnvConfig,
+        net_cfg: NetworkConfig,
+        ppo_cfg: PPOConfig,
+        run_dir="runs",
+        run_name: str = "run",
+    ):
         os.makedirs(run_dir, exist_ok=True)
 
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = run_dir
+        self.run_name = run_name
 
-        self.csv_path = os.path.join(run_dir, f"{self.timestamp}_episodes.csv")
-        self.config_path = os.path.join(run_dir, f"{self.timestamp}_config.json")
+        base = f"{self.run_name}"
 
-        # Save config immediately
+        self.csv_path = os.path.join(run_dir, f"{base}_episodes.csv")
+        self.config_path = os.path.join(run_dir, f"{base}_config.json")
+
         config_data = {
             "timestamp": self.timestamp,
+            "run_name": self.run_name,
             "env_config": asdict(env_cfg),
             "network_config": asdict(net_cfg),
             "ppo_config": asdict(ppo_cfg),
@@ -714,22 +817,66 @@ class RunLogger:
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2)
 
-        # Create CSV header
         with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "episode",
+                "env_step",
+                "world_id",
+                "episode_in_world",
                 "reward",
                 "food_eaten",
                 "steps_alive",
                 "update_index",
             ])
 
-    def log_episode(self, episode: int, reward: float, food_eaten: int, steps_alive: int, update_index: int):
+        self.world_changes_path = os.path.join(run_dir, f"{base}_world_changes.csv")
+
+        with open(self.world_changes_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "episode",
+                "env_step",
+                "from_world_id",
+                "to_world_id",
+                "update_index",
+            ])
+
+    def log_world_change(
+            self,
+            episode: int,
+            env_step: int,
+            from_world_id: int,
+            to_world_id: int,
+            update_index: int,
+    ):
+        with open(self.world_changes_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                episode,
+                env_step,
+                from_world_id,
+                to_world_id,
+                update_index,
+            ])
+    def log_episode(
+            self,
+            episode: int,
+            env_step: int,
+            world_id: int,
+            episode_in_world: int,
+            reward: float,
+            food_eaten: int,
+            steps_alive: int,
+            update_index: int,
+    ):
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 episode,
+                env_step,
+                world_id,
+                episode_in_world,
                 reward,
                 food_eaten,
                 steps_alive,
@@ -740,8 +887,15 @@ class RunLogger:
 # ============================================================
 
 class PPOTrainer:
-    def __init__(self, env: GridWorld, net_cfg: NetworkConfig, ppo_cfg: PPOConfig, env_cfg: EnvConfig,
-                 logger: Optional[RunLogger] = None):
+    def __init__(
+        self,
+        env: GridWorld,
+        net_cfg: NetworkConfig,
+        ppo_cfg: PPOConfig,
+        env_cfg: EnvConfig,
+        training_worlds: List[WorldSpec],
+        logger: Optional[RunLogger] = None
+    ):
         self.env = env
         self.env_cfg = env_cfg
         self.net_cfg = net_cfg
@@ -750,15 +904,25 @@ class PPOTrainer:
         self.current_update_index = 0
         self.device = torch.device(ppo_cfg.device)
 
+        self.total_env_steps = 0
+
+        self.training_worlds = training_worlds
+
         random.seed(ppo_cfg.seed)
         np.random.seed(ppo_cfg.seed)
         torch.manual_seed(ppo_cfg.seed)
 
         self.model = ActorCritic(env.obs_size, env.action_size, net_cfg).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=ppo_cfg.learning_rate)
+        weight_decay = ppo_cfg.l2_coefficient if ppo_cfg.use_l2_regularization else 0.0
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=ppo_cfg.learning_rate,
+            weight_decay=weight_decay,
+            betas=(ppo_cfg.adam_beta1, ppo_cfg.adam_beta2),
+        )
 
         self.buffer = RolloutBuffer()
-
+        self.episodes_per_world = [0 for _ in self.training_worlds]
         self.episode_count = 0
         self.best_episode_food = -1
 
@@ -771,11 +935,79 @@ class PPOTrainer:
             util = torch.zeros(num_units, dtype=torch.float32, device=self.device)
             self.hidden_utilities.append(util)
 
+        self.hidden_ages = []
+        self.hidden_replacement_residuals = []
+
+        for linear in self.model.hidden_linears:
+            num_units = linear.out_features
+            self.hidden_ages.append(torch.zeros(num_units, dtype=torch.long, device=self.device))
+            self.hidden_replacement_residuals.append(0.0)
+
+        self.current_world_idx = 0
+        self.current_world_steps = 0
+
+        self.current_obs = self.env.reset(
+            world_spec=self.training_worlds[self.current_world_idx]
+        )
+
+
+
+    def _current_world(self) -> WorldSpec:
+        return self.training_worlds[self.current_world_idx]
+
+    def _reset_episode_in_current_world(self):
+        self.current_obs = self.env.reset(
+            world_spec=self._current_world()
+        )
+
+    def _switch_world(self):
+        old_world_idx = self.current_world_idx
+        self.current_world_idx = (self.current_world_idx + 1) % len(self.training_worlds)
+        self.current_world_steps = 0
+
+        if self.logger is not None:
+            self.logger.log_world_change(
+                episode=self.episode_count,
+                env_step=self.total_env_steps,
+                from_world_id=int(self.training_worlds[old_world_idx].world_id),
+                to_world_id=int(self.training_worlds[self.current_world_idx].world_id),
+                update_index=self.current_update_index,
+            )
+
+        self.current_obs = self.env.reset(
+            world_spec=self._current_world()
+        )
+
+    def _finish_episode_and_log(self, info):
+        self.episode_count += 1
+        self.episodes_per_world[self.current_world_idx] += 1
+        self.best_episode_food = max(self.best_episode_food, int(info["food_eaten"]))
+
+        if self.logger is not None:
+            self.logger.log_episode(
+                episode=self.episode_count,
+                env_step=self.total_env_steps,
+                world_id=int(self._current_world().world_id),
+                episode_in_world=self.episodes_per_world[self.current_world_idx],
+                reward=float(info["episode_return"]),
+                food_eaten=int(info["food_eaten"]),
+                steps_alive=int(info["steps_alive"]),
+                update_index=self.current_update_index,
+            )
+
+    def average_weight_magnitude(self):
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if p.ndim >= 1:
+                    total += p.abs().sum().item()
+                    count += p.numel()
+        return total / max(count, 1)
+
+
     def update_hidden_utilities(self):
         if not self.cfg.use_continual_backprop:
-            return
-
-        if not hasattr(self.model, "last_hidden_activations"):
             return
 
         if len(self.model.last_hidden_activations) != len(self.hidden_utilities):
@@ -785,42 +1017,62 @@ class PPOTrainer:
 
         for layer_idx, acts in enumerate(self.model.last_hidden_activations):
             # acts shape: [batch, units]
-            mean_abs = acts.abs().mean(dim=0).detach()
+            mean_abs_act = acts.abs().mean(dim=0).detach()
+
+            # outgoing weights from this hidden layer
+            if layer_idx + 1 < len(self.model.hidden_linears):
+                next_weight = self.model.hidden_linears[layer_idx + 1].weight.detach()
+                outgoing_mag = next_weight.abs().sum(dim=0)
+            else:
+                # last hidden layer feeds both policy and value heads
+                policy_mag = self.model.policy_head.weight.detach().abs().sum(dim=0)
+                value_mag = self.model.value_head.weight.detach().abs().sum(dim=0)
+                outgoing_mag = policy_mag + value_mag
+
+            instant_utility = mean_abs_act * outgoing_mag
+
             self.hidden_utilities[layer_idx] = (
                     decay * self.hidden_utilities[layer_idx]
-                    + (1.0 - decay) * mean_abs
+                    + (1.0 - decay) * instant_utility
             )
+
+            # all units age by one update
+            self.hidden_ages[layer_idx] += 1
 
     def maybe_apply_continual_backprop(self):
         if not self.cfg.use_continual_backprop:
             return
 
-        if self.gradient_step_count < self.cfg.cbp_min_steps_before_reinit:
-            return
-
         for layer_idx, util in enumerate(self.hidden_utilities):
-            num_units = util.shape[0]
-            num_reinit = max(1, int(num_units * self.cfg.cbp_reinit_fraction))
+            ages = self.hidden_ages[layer_idx]
+            mature_mask = ages >= self.cfg.cbp_min_steps_before_reinit
+
+            mature_indices = torch.nonzero(mature_mask, as_tuple=False).flatten()
+            num_mature = int(mature_indices.numel())
+
+            if num_mature == 0:
+                continue
+
+            expected = num_mature * self.cfg.cbp_reinit_fraction + self.hidden_replacement_residuals[layer_idx]
+            num_reinit = int(expected)
+            self.hidden_replacement_residuals[layer_idx] = expected - num_reinit
 
             if num_reinit <= 0:
                 continue
 
-            # Least-used units
-            _, least_used_idx = torch.topk(util, k=num_reinit, largest=False)
+            mature_utils = util[mature_indices]
+            _, local_idx = torch.topk(mature_utils, k=min(num_reinit, num_mature), largest=False)
+            chosen = mature_indices[local_idx]
 
-            for idx_tensor in least_used_idx:
+            for idx_tensor in chosen:
                 neuron_idx = int(idx_tensor.item())
 
-                # Reinitialize incoming weights + bias
                 self.model.reinitialize_neuron(f"hidden:{layer_idx}", neuron_idx)
-
-                # Zero outgoing weights into the next layer / policy head
                 self.model.zero_outgoing_to_neuron_in_next_layer(layer_idx, neuron_idx)
 
-                # Reset utility so it can compete again fairly
                 self.hidden_utilities[layer_idx][neuron_idx] = 0.0
+                self.hidden_ages[layer_idx][neuron_idx] = 0
 
-                # Clear Adam state for this neuron's incoming weights/bias
                 self._clear_optimizer_state_for_neuron(layer_idx, neuron_idx)
 
     def _clear_optimizer_state_for_neuron(self, hidden_layer_idx: int, neuron_idx: int):
@@ -846,9 +1098,10 @@ class PPOTrainer:
 
     def collect_rollout(self, render=False, screen=None, clock=None, font=None, render_every=10):
         self.buffer.clear()
-        obs = self.env.reset()
 
-        for step_idx in range(self.cfg.rollout_steps):
+        obs = self.current_obs
+
+        for step_idx in range(self.cfg.steps_per_update):
             if render and step_idx % render_every == 0:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -870,43 +1123,39 @@ class PPOTrainer:
 
             next_obs, reward, done, info = self.env.step(action)
 
+            self.total_env_steps += 1
+            self.current_world_steps += 1
+
             self.buffer.add(obs, action, log_prob, reward, done, value)
             obs = next_obs
 
+            # End of episode: reset in the SAME current world
             if done:
-                self.episode_count += 1
-                self.best_episode_food = max(self.best_episode_food, info["food_eaten"])
+                self._finish_episode_and_log(info)
+                self._reset_episode_in_current_world()
+                obs = self.current_obs
 
-                if self.logger is not None:
-                    self.logger.log_episode(
-                        episode=self.episode_count,
-                        reward=float(reward),
-                        food_eaten=int(info["food_eaten"]),
-                        steps_alive=int(info["steps_alive"]),
-                        update_index=self.current_update_index,
-                    )
+            # End of world phase: switch to NEXT world in the cycle
+            if self.current_world_steps >= self.cfg.steps_per_world:
+                self._switch_world()
+                obs = self.current_obs
 
-                obs = self.env.reset()
+            if self.total_env_steps >= self.cfg.total_env_steps_target:
+                break
+
+        self.current_obs = obs
 
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             _, last_value_t = self.model.forward(obs_t)
         last_value = float(last_value_t.item())
 
-        self.buffer.compute_returns_and_advantages(
-            last_value=last_value,
-            gamma=self.cfg.gamma,
-            gae_lambda=self.cfg.gae_lambda,
-        )
-    def compute_l2_penalty(self):
-        if not self.cfg.use_l2_regularization:
-            return torch.tensor(0.0, device=self.device)
-
-        l2 = torch.tensor(0.0, device=self.device)
-        for p in self.model.parameters():
-            if p.requires_grad:
-                l2 = l2 + torch.sum(p * p)
-        return self.cfg.l2_coefficient * l2
+        if len(self.buffer.rewards) > 0:
+            self.buffer.compute_returns_and_advantages(
+                last_value=last_value,
+                gamma=self.cfg.gamma,
+                gae_lambda=self.cfg.gae_lambda,
+            )
 
     def update(self):
         obs = torch.tensor(np.array(self.buffer.obs), dtype=torch.float32, device=self.device)
@@ -922,7 +1171,6 @@ class PPOTrainer:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
-            "l2": 0.0,
             "num_updates": 0,
         }
 
@@ -954,13 +1202,10 @@ class PPOTrainer:
                 value_loss = torch.mean((mb_returns - values) ** 2)
                 entropy_bonus = entropy.mean()
 
-                l2_penalty = self.compute_l2_penalty()
-
                 loss = (
-                    policy_loss
-                    + self.cfg.value_coef * value_loss
-                    - self.cfg.entropy_coef * entropy_bonus
-                    + l2_penalty
+                        policy_loss
+                        + self.cfg.value_coef * value_loss
+                        - self.cfg.entropy_coef * entropy_bonus
                 )
 
                 self.optimizer.zero_grad()
@@ -973,10 +1218,9 @@ class PPOTrainer:
                 stats["policy_loss"] += float(policy_loss.item())
                 stats["value_loss"] += float(value_loss.item())
                 stats["entropy"] += float(entropy_bonus.item())
-                stats["l2"] += float(l2_penalty.item())
                 stats["num_updates"] += 1
 
-        for k in ("policy_loss", "value_loss", "entropy", "l2"):
+        for k in ("policy_loss", "value_loss", "entropy"):
             stats[k] /= max(stats["num_updates"], 1)
 
         return stats
@@ -986,8 +1230,11 @@ class PPOTrainer:
         if render:
             screen, clock, font = init_training_viewer()
 
-        for update in range(1, self.cfg.total_updates + 1):
+        update = 0
+        while self.total_env_steps < self.cfg.total_env_steps_target:
+            update += 1
             self.current_update_index = update
+
             self.collect_rollout(
                 render=render,
                 screen=screen,
@@ -998,15 +1245,25 @@ class PPOTrainer:
             stats = self.update()
 
             if update % 10 == 0 or update == 1:
+                avg_w = self.average_weight_magnitude()
+                current_world = self._current_world()
+
                 print(
-                    f"Update {update:4d}/{self.cfg.total_updates} | "
+                    f"Update {update:5d} | "
+                    f"EnvSteps {self.total_env_steps:8d}/{self.cfg.total_env_steps_target} | "
+                    f"World {current_world.world_id:2d} | "
+                    f"WorldSteps {self.current_world_steps:6d}/{self.cfg.steps_per_world} | "
+                    f"F1 {current_world.food1_energy:6.2f} | "
+                    f"F2 {current_world.food2_energy:6.2f} | "
                     f"Episodes {self.episode_count:5d} | "
                     f"BestFood {self.best_episode_food:3d} | "
                     f"PolicyLoss {stats['policy_loss']:.4f} | "
                     f"ValueLoss {stats['value_loss']:.4f} | "
                     f"Entropy {stats['entropy']:.4f} | "
-                    f"L2 {stats['l2']:.6f}"
+                    f"Avg|W| {avg_w:.6f}"
                 )
+
+        print(f"\nTraining complete: reached {self.episode_count} episodes.\n")
 
     def save(self, path="ppo_gridworld.pt"):
         torch.save(
@@ -1017,147 +1274,46 @@ class PPOTrainer:
             path
         )
 
-    def load(self, path="ppo_gridworld.pt"):
-        data = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(data["model_state_dict"])
-
-    def select_action_greedy(self, obs: np.ndarray) -> int:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            logits, _ = self.model.forward(obs_t)
-            action = torch.argmax(logits, dim=-1)
-        return int(action.item())
-
-    def select_action_sample(self, obs: np.ndarray) -> int:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            action_t, _, _ = self.model.act(obs_t)
-        return int(action_t.item())
-
-
-# ============================================================
-# Pygame Viewer
-# ============================================================
-
-def watch_trained_agent(trainer: PPOTrainer, env_cfg: EnvConfig, greedy: bool = True):
-    pygame.init()
-    pygame.display.set_caption("Trained PPO GridWorld")
-    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont(None, 28)
-
-    env = GridWorld(env_cfg)
-
-    obs = env.reset()
-    running = True
-    episode_idx = 0
-
-    while running:
-        clock.tick(FPS)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_r:
-                    obs = env.reset()
-                    episode_idx += 1
-
-        if greedy:
-            action = trainer.select_action_greedy(obs)
-        else:
-            action = trainer.select_action_sample(obs)
-
-        obs, reward, done, info = env.step(action)
-
-        env.draw(screen, font)
-        pygame.display.flip()
-
-        if done:
-            print(f"Viewer episode {episode_idx}: terminal reward = {reward}, food eaten = {info['food_eaten']}")
-            obs = env.reset()
-            episode_idx += 1
-
-    pygame.quit()
-
 
 # ============================================================
 # Example weight/neuron editing helpers
 # ============================================================
 
-def demo_direct_weight_edits(trainer: PPOTrainer):
-    model = trainer.model
+def run_experiment(
+    run_name: str,
+    use_l2: bool,
+    use_cb: bool,
+    seed: int,
+    training_worlds: List[WorldSpec],
+):
+    adam_beta1 = 0.9
+    adam_beta2 = 0.999
 
-    # Read one connection
-    w = model.get_weight("hidden:0", 0, 0)
-    print("Before: hidden:0 weight[0,0] =", w)
+    if run_name != "ppo":
+        adam_beta1 = 0.99
+        adam_beta2 = 0.99
 
-    # Set one connection
-    model.set_weight("hidden:0", 0, 0, 0.25)
-
-    # Add to one connection
-    model.add_to_weight("hidden:0", 0, 1, -0.10)
-
-    # Zero one connection
-    model.zero_weight("hidden:0", 0, 2)
-
-    # Read / set bias
-    b = model.get_bias("hidden:0", 0)
-    print("Before: hidden:0 bias[0] =", b)
-    model.set_bias("hidden:0", 0, 0.05)
-
-    # Replace all incoming weights for neuron 1 in hidden layer 0
-    incoming_size = model.get_named_linear_layer("hidden:0").weight.shape[1]
-    new_weights = np.zeros(incoming_size, dtype=np.float32)
-    model.set_neuron_weights("hidden:0", 1, new_weights, bias=0.0)
-
-    # Scale an entire neuron
-    model.scale_neuron("hidden:0", 2, 0.5)
-
-    # Zero an entire policy output neuron
-    model.zero_neuron("policy", 0)
-
-    print("After: hidden:0 weight[0,0] =", model.get_weight("hidden:0", 0, 0))
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-    # ----------------------------
-    # Configure environment
-    # ----------------------------
     env_cfg = EnvConfig(
-        width=20,
-        height=20,
-        num_food1=20,
-        num_food2=12,
-        max_energy=20,
-        food_energy=20,
+        width=30,
+        height=30,
+        num_food1=30,
+        num_food2=30,
+        food1_energy=int(GLOBAL_ENERGY_E),
+        food2_energy=int(GLOBAL_ENERGY_E),
+        episode_horizon=200,
     )
 
-    # ----------------------------
-    # Configure network
-    # Change this to control layers/neurons directly
-    # Examples:
-    #   [64]
-    #   [128, 128]
-    #   [256, 128, 64]
-    # ----------------------------
     net_cfg = NetworkConfig(
-        hidden_sizes=[128, 128],
+        hidden_sizes=[256, 256],
         activation="tanh",
     )
 
-    # ----------------------------
-    # Configure PPO
-    # L2 can be enabled/disabled here
-    # ----------------------------
+    steps_per_world = 60_000
+
     ppo_cfg = PPOConfig(
-        rollout_steps=2048,
+        total_env_steps_target=NUM_TRAIN_WORLDS * steps_per_world,
+        steps_per_update=2048,
+        steps_per_world=steps_per_world,
         ppo_epochs=10,
         minibatch_size=256,
         gamma=0.99,
@@ -1167,42 +1323,82 @@ def main():
         value_coef=0.5,
         entropy_coef=0.01,
         max_grad_norm=0.5,
-        use_l2_regularization=False,
-        l2_coefficient=1e-6,
-        use_continual_backprop=True, 
+        use_l2_regularization=use_l2,
+        l2_coefficient=1e-4,
+        use_continual_backprop=use_cb,
         cbp_decay=0.99,
-        cbp_reinit_fraction=0.01,
-        cbp_min_steps_before_reinit=100,
-        total_updates=300,
+        cbp_reinit_fraction=1e-4,
+        cbp_min_steps_before_reinit=10_000,
         device="cpu",
-        seed=1,
+        seed=seed,
+        adam_beta1=adam_beta1,
+        adam_beta2=adam_beta2,
     )
 
-    env = GridWorld(env_cfg)
-    run_logger = RunLogger(env_cfg, net_cfg, ppo_cfg, run_dir="runs")
-    print("Episode log file:", run_logger.csv_path)
-    print("Config file:", run_logger.config_path)
-    trainer = PPOTrainer(env, net_cfg, ppo_cfg, env_cfg=env_cfg, logger=run_logger)
+    env = GridWorld(env_cfg, seed=seed)
+    run_logger = RunLogger(env_cfg, net_cfg, ppo_cfg, run_dir="runs", run_name=run_name)
 
-    print("Observation size:", env.obs_size)
-    print("Action size:", env.action_size)
-    print("Hidden sizes:", net_cfg.hidden_sizes)
-    print("L2 enabled:", ppo_cfg.use_l2_regularization)
-    print("L2 coefficient:", ppo_cfg.l2_coefficient)
-    print("Continual backprop enabled:", ppo_cfg.use_continual_backprop)
-    print("CBP reinit fraction:", ppo_cfg.cbp_reinit_fraction)
+    trainer = PPOTrainer(
+        env=env,
+        net_cfg=net_cfg,
+        ppo_cfg=ppo_cfg,
+        env_cfg=env_cfg,
+        training_worlds=training_worlds,
+        logger=run_logger,
+    )
 
-    # Optional: direct surgery on the network before training
-    # demo_direct_weight_edits(trainer)
+    print(f"[{run_name}] Episode log file: {run_logger.csv_path}")
+    print(f"[{run_name}] Config file: {run_logger.config_path}")
+    print(f"[{run_name}] L2 enabled: {ppo_cfg.use_l2_regularization}")
+    print(f"[{run_name}] CB enabled: {ppo_cfg.use_continual_backprop}")
+    print(f"[{run_name}] Number of fixed training worlds: {len(training_worlds)}")
+    print(f"[{run_name}] Global energy E: {GLOBAL_ENERGY_E}")
+    print(f"[{run_name}] Steps per world: {ppo_cfg.steps_per_world}")
 
-    # Train PPO
-    trainer.train(render=True)
+    trainer.train(render=False)
+    trainer.save(f"{run_name}.pt")
+# ============================================================
+# Main
+# ============================================================
+from multiprocessing import Process
 
-    # Save model
-    trainer.save("ppo_gridworld.pt")
+def main():
+    env_cfg = EnvConfig(
+        width=30,
+        height=30,
+        num_food1=30,
+        num_food2=30,
+        food1_energy=int(GLOBAL_ENERGY_E),
+        food2_energy=int(GLOBAL_ENERGY_E),
+        episode_horizon=200,
+    )
 
-    # Watch trained agent
-    watch_trained_agent(trainer, env_cfg, greedy=True)
+    training_worlds = generate_training_worlds(
+        cfg=env_cfg,
+        num_worlds=NUM_TRAIN_WORLDS,
+        E=GLOBAL_ENERGY_E,
+        seed=TRAIN_WORLD_SEED,
+    )
+
+    jobs = [
+        ("ppo", False, False, 1),
+        ("ppo_l2", True, False, 1),
+        ("ppo_cb", False, True, 1),
+        ("ppo_l2_cb", True, True, 1),
+    ]
+
+    processes = []
+    for run_name, use_l2, use_cb, seed in jobs:
+        p = Process(target=run_experiment, args=(run_name, use_l2, use_cb, seed, training_worlds))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    print("All training experiments finished.")
+
+
 
 def init_training_viewer():
     pygame.init()
@@ -1211,6 +1407,7 @@ def init_training_viewer():
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 28)
     return screen, clock, font
+
 
 if __name__ == "__main__":
     main()
