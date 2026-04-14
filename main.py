@@ -52,7 +52,7 @@ WALL = 4
 # ============================================================
 
 GLOBAL_ENERGY_E = 20.0
-NUM_TRAIN_WORLDS = 10
+NUM_TRAIN_WORLDS = 20
 TRAIN_WORLD_SEED = 123
 
 
@@ -81,6 +81,9 @@ class WorldSpec:
     epsilon2: float = 1.0
     world_id: int = -1
     randomize_agent_start: bool = False
+    drift_mode: str = "none"  # "none", "left", "right"
+    drift_prob: float = 0.0
+
 @dataclass
 class EnvConfig:
     width: int = 40
@@ -191,31 +194,32 @@ def generate_training_worlds(
     E: float,
     seed: int,
 ) -> List[WorldSpec]:
-    base = generate_base_world(cfg, seed)
+    rng = random.Random(seed)
     worlds = []
 
     for i in range(num_worlds):
         if i % 2 == 0:
             food1_energy = +E
             food2_energy = -E
+            drift_mode = "left"
+            drift_prob = 0.20
         else:
             food1_energy = -E
             food2_energy = +E
+            drift_mode = "right"
+            drift_prob = 0.20
 
-        worlds.append(
-            WorldSpec(
-                width=base.width,
-                height=base.height,
-                agent_start=base.agent_start,
-                food1_positions=list(base.food1_positions),
-                food2_positions=list(base.food2_positions),
-                food1_energy=float(food1_energy),
-                food2_energy=float(food2_energy),
-                epsilon1=base.epsilon1,
-                epsilon2=base.epsilon2,
-                world_id=i,
-            )
+        spec = generate_world_spec(
+            cfg=cfg,
+            rng=rng,
+            food1_energy=food1_energy,
+            food2_energy=food2_energy,
+            world_id=i,
         )
+        spec.randomize_agent_start = True
+        spec.drift_mode = drift_mode
+        spec.drift_prob = drift_prob
+        worlds.append(spec)
 
     return worlds
 
@@ -262,6 +266,9 @@ class GridWorld:
         self.grid[y][x] = food_tile
 
     def load_world(self, world_spec: WorldSpec):
+        self.drift_mode = world_spec.drift_mode
+        self.drift_prob = world_spec.drift_prob
+
         self.width = world_spec.width
         self.height = world_spec.height
         self.food1_energy = float(world_spec.food1_energy)
@@ -441,6 +448,14 @@ class GridWorld:
         return self.get_observation()
 
     def step(self, action: int):
+        if self.rng.random() < getattr(self, "drift_prob", 0.0):
+            drift_mode = getattr(self, "drift_mode", "none")
+
+            if drift_mode == "left":
+                action = self._drift_left_of(action)
+            elif drift_mode == "right":
+                action = self._drift_right_of(action)
+
         dx, dy = self.ACTIONS[action]
         ax, ay = self.agent_pos
         nx = ax + dx
@@ -490,6 +505,14 @@ class GridWorld:
             "episode_return": self.episode_return,
         }
         return obs, reward, done, info
+
+    def _drift_left_of(self, action: int) -> int:
+        # up->left, left->down, down->right, right->up
+        return {0: 2, 2: 1, 1: 3, 3: 0}[action]
+
+    def _drift_right_of(self, action: int) -> int:
+        # up->right, right->down, down->left, left->up
+        return {0: 3, 3: 1, 1: 2, 2: 0}[action]
 
     def get_observation(self) -> np.ndarray:
         ax, ay = self.agent_pos
@@ -632,21 +655,19 @@ class GridWorld:
 # ============================================================
 
 class ActorCritic(nn.Module):
-    """
-    Shared torso + policy head + value head.
-    Provides direct functions to inspect and modify layers, neurons, and connections.
-    """
-
     def __init__(self, input_dim: int, action_dim: int, net_cfg: NetworkConfig):
         super().__init__()
         self.input_dim = input_dim
         self.action_dim = action_dim
         self.hidden_sizes = list(net_cfg.hidden_sizes)
+        self.activation_name = net_cfg.activation
 
         if net_cfg.activation == "relu":
             act_cls = nn.ReLU
+            self.hidden_gain = math.sqrt(2.0)
         else:
             act_cls = nn.Tanh
+            self.hidden_gain = 5.0 / 3.0
 
         layers = []
         prev = input_dim
@@ -655,8 +676,7 @@ class ActorCritic(nn.Module):
 
         for h in self.hidden_sizes:
             linear = nn.Linear(prev, h)
-            nn.init.orthogonal_(linear.weight, gain=math.sqrt(2))
-            nn.init.constant_(linear.bias, 0.0)
+            self._init_hidden_linear(linear)
             self.hidden_linears.append(linear)
             layers.append(linear)
             layers.append(act_cls())
@@ -673,12 +693,34 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.constant_(self.value_head.bias, 0.0)
 
+    def _init_hidden_linear(self, layer: nn.Linear):
+        nn.init.kaiming_uniform_(
+            layer.weight,
+            a=0.0,
+            mode="fan_in",
+            nonlinearity="relu" if self.activation_name == "relu" else "linear",
+        )
+        nn.init.constant_(layer.bias, 0.0)
+
     def reinitialize_neuron(self, layer_name: str, neuron_idx: int):
         layer = self.get_named_linear_layer(layer_name)
 
         with torch.no_grad():
-            nn.init.orthogonal_(layer.weight[neuron_idx:neuron_idx + 1], gain=math.sqrt(2))
+            nn.init.kaiming_uniform_(
+                layer.weight[neuron_idx:neuron_idx + 1],
+                a=0.0,
+                mode="fan_in",
+                nonlinearity="relu" if self.activation_name == "relu" else "linear",
+            )
             layer.bias[neuron_idx] = 0.0
+    def effective_rank(matrix: torch.Tensor):
+        s = torch.linalg.svdvals(matrix)
+        s = s[s > 1e-12]
+        if s.numel() == 0:
+            return 0.0
+        p = s / s.sum()
+        entropy = -(p * torch.log(p)).sum()
+        return float(torch.exp(entropy).item())
 
     def zero_outgoing_to_neuron_in_next_layer(self, hidden_layer_idx: int, neuron_idx: int):
         with torch.no_grad():
@@ -951,6 +993,20 @@ class PPOTrainer:
         )
 
 
+    def measure_dormant_fraction(self, sample_obs: np.ndarray, threshold: float = 0.01):
+        x = torch.tensor(sample_obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            _ = self.model.forward(x)
+            acts = self.model.last_hidden_activations
+
+        total = 0
+        dormant = 0
+        for a in acts:
+            mean_abs = a.abs().mean(dim=0)
+            dormant += int((mean_abs < threshold).sum().item())
+            total += mean_abs.numel()
+
+        return dormant / max(total, 1)
 
     def _current_world(self) -> WorldSpec:
         return self.training_worlds[self.current_world_idx]
@@ -1286,10 +1342,11 @@ def run_experiment(
     seed: int,
     training_worlds: List[WorldSpec],
 ):
-    adam_beta1 = 0.9
-    adam_beta2 = 0.999
-
-    if run_name != "ppo":
+    # paper-like optimizer settings by condition
+    if run_name == "ppo_standard":
+        adam_beta1 = 0.9
+        adam_beta2 = 0.999
+    else:
         adam_beta1 = 0.99
         adam_beta2 = 0.99
 
@@ -1305,10 +1362,10 @@ def run_experiment(
 
     net_cfg = NetworkConfig(
         hidden_sizes=[256, 256],
-        activation="tanh",
+        activation="relu",
     )
 
-    steps_per_world = 60_000
+    steps_per_world = 100_000   # much closer to the paper's switch interval
 
     ppo_cfg = PPOConfig(
         total_env_steps_target=NUM_TRAIN_WORLDS * steps_per_world,
@@ -1319,7 +1376,7 @@ def run_experiment(
         gamma=0.99,
         gae_lambda=0.95,
         clip_epsilon=0.2,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         value_coef=0.5,
         entropy_coef=0.01,
         max_grad_norm=0.5,
@@ -1327,7 +1384,7 @@ def run_experiment(
         l2_coefficient=1e-4,
         use_continual_backprop=use_cb,
         cbp_decay=0.99,
-        cbp_reinit_fraction=1e-4,
+        cbp_reinit_fraction=1e-4,          # closer to paper RL setting
         cbp_min_steps_before_reinit=10_000,
         device="cpu",
         seed=seed,
@@ -1351,8 +1408,7 @@ def run_experiment(
     print(f"[{run_name}] Config file: {run_logger.config_path}")
     print(f"[{run_name}] L2 enabled: {ppo_cfg.use_l2_regularization}")
     print(f"[{run_name}] CB enabled: {ppo_cfg.use_continual_backprop}")
-    print(f"[{run_name}] Number of fixed training worlds: {len(training_worlds)}")
-    print(f"[{run_name}] Global energy E: {GLOBAL_ENERGY_E}")
+    print(f"[{run_name}] Number of training worlds: {len(training_worlds)}")
     print(f"[{run_name}] Steps per world: {ppo_cfg.steps_per_world}")
 
     trainer.train(render=False)
@@ -1381,9 +1437,8 @@ def main():
     )
 
     jobs = [
-        ("ppo", False, False, 1),
-        ("ppo_l2", True, False, 1),
-        ("ppo_cb", False, True, 1),
+        ("ppo_standard", False, False, 1),
+        ("ppo_tuned", False, False, 1),
         ("ppo_l2_cb", True, True, 1),
     ]
 

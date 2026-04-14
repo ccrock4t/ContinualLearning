@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 RUNS_DIR = "runs"
-METHODS = ["ppo", "ppo_l2", "ppo_cb", "ppo_l2_cb"]
+METHODS = ["ppo", "ppo_l2", "ppo_l2_cb"]
 
 SMOOTH_WINDOW = 20
 SHOW_WORLD_SWITCHES = True
