@@ -81,8 +81,8 @@ class WorldSpec:
     epsilon2: float = 1.0
     world_id: int = -1
     randomize_agent_start: bool = False
-    drift_mode: str = "none"  # "none", "left", "right"
-    drift_prob: float = 0.0
+    action_permutation: Optional[List[int]] = None
+    observation_permutation: Optional[List[int]] = None
 
 @dataclass
 class EnvConfig:
@@ -201,13 +201,9 @@ def generate_training_worlds(
         if i % 2 == 0:
             food1_energy = +E
             food2_energy = -E
-            drift_mode = "left"
-            drift_prob = 0.20
         else:
             food1_energy = -E
             food2_energy = +E
-            drift_mode = "right"
-            drift_prob = 0.20
 
         spec = generate_world_spec(
             cfg=cfg,
@@ -217,8 +213,16 @@ def generate_training_worlds(
             world_id=i,
         )
         spec.randomize_agent_start = True
-        spec.drift_mode = drift_mode
-        spec.drift_prob = drift_prob
+
+        perm = [0, 1, 2, 3]
+        rng.shuffle(perm)
+        spec.action_permutation = perm
+
+        obs_dim = 3 * 3 * 5 + 8
+        obs_perm = list(range(obs_dim))
+        rng.shuffle(obs_perm)
+        spec.observation_permutation = obs_perm
+
         worlds.append(spec)
 
     return worlds
@@ -252,6 +256,8 @@ class GridWorld:
         self.smell_max_value = 1.0
 
         self.rng = random.Random(seed)
+        self.action_permutation = [0, 1, 2, 3]
+        self.observation_permutation = list(range(self.obs_size))
         self.reset()
 
     def _random_empty_cell(self):
@@ -266,8 +272,15 @@ class GridWorld:
         self.grid[y][x] = food_tile
 
     def load_world(self, world_spec: WorldSpec):
-        self.drift_mode = world_spec.drift_mode
-        self.drift_prob = world_spec.drift_prob
+        if world_spec.action_permutation is None:
+            self.action_permutation = [0, 1, 2, 3]
+        else:
+            self.action_permutation = list(world_spec.action_permutation)
+
+        if world_spec.observation_permutation is None:
+            self.observation_permutation = list(range(self.obs_size))
+        else:
+            self.observation_permutation = list(world_spec.observation_permutation)
 
         self.width = world_spec.width
         self.height = world_spec.height
@@ -448,15 +461,8 @@ class GridWorld:
         return self.get_observation()
 
     def step(self, action: int):
-        if self.rng.random() < getattr(self, "drift_prob", 0.0):
-            drift_mode = getattr(self, "drift_mode", "none")
-
-            if drift_mode == "left":
-                action = self._drift_left_of(action)
-            elif drift_mode == "right":
-                action = self._drift_right_of(action)
-
-        dx, dy = self.ACTIONS[action]
+        mapped_action = self.action_permutation[action]
+        dx, dy = self.ACTIONS[mapped_action]
         ax, ay = self.agent_pos
         nx = ax + dx
         ny = ay + dy
@@ -506,14 +512,6 @@ class GridWorld:
         }
         return obs, reward, done, info
 
-    def _drift_left_of(self, action: int) -> int:
-        # up->left, left->down, down->right, right->up
-        return {0: 2, 2: 1, 1: 3, 3: 0}[action]
-
-    def _drift_right_of(self, action: int) -> int:
-        # up->right, right->down, down->left, left->up
-        return {0: 3, 3: 1, 1: 2, 2: 0}[action]
-
     def get_observation(self) -> np.ndarray:
         ax, ay = self.agent_pos
         vision = np.zeros((5, 3, 3), dtype=np.float32)
@@ -541,7 +539,9 @@ class GridWorld:
         )
         smell = smell / max(self.smell_max_value, 1e-6)
 
-        return np.concatenate([flat, smell], axis=0)
+        obs = np.concatenate([flat, smell], axis=0)
+        obs = obs[self.observation_permutation]
+        return obs
 
     @property
     def obs_size(self) -> int:
@@ -835,7 +835,7 @@ class RunLogger:
         env_cfg: EnvConfig,
         net_cfg: NetworkConfig,
         ppo_cfg: PPOConfig,
-        run_dir="runs",
+        run_dir="grid_runs",
         run_name: str = "run",
     ):
         os.makedirs(run_dir, exist_ok=True)
@@ -1342,13 +1342,8 @@ def run_experiment(
     seed: int,
     training_worlds: List[WorldSpec],
 ):
-    # paper-like optimizer settings by condition
-    if run_name == "ppo_standard":
-        adam_beta1 = 0.9
-        adam_beta2 = 0.999
-    else:
-        adam_beta1 = 0.99
-        adam_beta2 = 0.99
+    adam_beta1 = 0.9
+    adam_beta2 = 0.999
 
     env_cfg = EnvConfig(
         width=30,
@@ -1365,7 +1360,7 @@ def run_experiment(
         activation="relu",
     )
 
-    steps_per_world = 100_000   # much closer to the paper's switch interval
+    steps_per_world = 100_000
 
     ppo_cfg = PPOConfig(
         total_env_steps_target=NUM_TRAIN_WORLDS * steps_per_world,
@@ -1384,16 +1379,15 @@ def run_experiment(
         l2_coefficient=1e-4,
         use_continual_backprop=use_cb,
         cbp_decay=0.99,
-        cbp_reinit_fraction=1e-4,          # closer to paper RL setting
+        cbp_reinit_fraction=1e-4,
         cbp_min_steps_before_reinit=10_000,
         device="cpu",
         seed=seed,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
     )
-
     env = GridWorld(env_cfg, seed=seed)
-    run_logger = RunLogger(env_cfg, net_cfg, ppo_cfg, run_dir="runs", run_name=run_name)
+    run_logger = RunLogger(env_cfg, net_cfg, ppo_cfg, run_dir="grid_runs", run_name=run_name)
 
     trainer = PPOTrainer(
         env=env,
@@ -1437,8 +1431,9 @@ def main():
     )
 
     jobs = [
-        ("ppo_standard", False, False, 1),
-        ("ppo_tuned", False, False, 1),
+        ("ppo", False, False, 1),
+        ("ppo_l2", True, False, 1),
+        ("ppo_cb", False, True, 1),
         ("ppo_l2_cb", True, True, 1),
     ]
 

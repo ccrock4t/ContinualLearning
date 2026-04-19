@@ -2,8 +2,9 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
-RUNS_DIR = "runs"
-METHODS = ["ppo", "ppo_l2", "ppo_l2_cb"]
+RUNS_DIR = "grid_runs"
+METHODS = ["ppo", "ppo_l2", "ppo_cb", "ppo_l2_cb"]
+
 
 SMOOTH_WINDOW = 20
 SHOW_WORLD_SWITCHES = True
@@ -76,6 +77,10 @@ def plot_metric(methods, metric_col, smooth_col=None, ylabel="", title="", runs_
     plt.title(title)
     plt.legend()
     plt.tight_layout()
+
+
+    plt.savefig("data.pdf", format="pdf", bbox_inches="tight")
+
     plt.show()
 
 
