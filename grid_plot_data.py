@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 RUNS_DIR = "grid_runs"
-METHODS = ["ppo", "ppo_cb"]   # or ["ppo", "ppo_l2", "ppo_cb", "ppo_l2_cb"]
+METHODS = ["ppo", "ppo_l2_cb"]   # or ["ppo", "ppo_l2", "ppo_cb", "ppo_l2_cb"]
 
 NUM_TRIALS = 10
 SMOOTH_WINDOW = 20
