@@ -52,7 +52,7 @@ WALL = 4
 # ============================================================
 
 GLOBAL_ENERGY_E = 20.0
-NUM_TRAIN_WORLDS = 20
+NUM_TRAIN_WORLDS = 40
 TRAIN_WORLD_SEED = 123
 
 
@@ -93,6 +93,13 @@ class EnvConfig:
     food1_energy: int = 20
     food2_energy: int = 20
     episode_horizon: int = 100
+
+    # survival
+    use_survival: bool = True
+    initial_energy: float = 40.0
+    step_energy_cost: float = 1.0
+    max_energy: float = 80.0
+    end_episode_on_zero_energy: bool = True
 
 
 
@@ -199,11 +206,11 @@ def generate_training_worlds(
 
     for i in range(num_worlds):
         if i % 2 == 0:
-            food1_energy = +E
-            food2_energy = -E
+            food1_energy = E
+            food2_energy = 0.1*E
         else:
-            food1_energy = -E
-            food2_energy = +E
+            food1_energy = 0.1*E
+            food2_energy = E
 
         spec = generate_world_spec(
             cfg=cfg,
@@ -255,6 +262,15 @@ class GridWorld:
         self.corner_smell_food2 = [0.0, 0.0, 0.0, 0.0]
         self.smell_max_value = 1.0
 
+        self.use_survival = cfg.use_survival
+        self.initial_energy = float(cfg.initial_energy)
+        self.step_energy_cost = float(cfg.step_energy_cost)
+        self.max_energy = float(cfg.max_energy)
+        self.end_episode_on_zero_energy = bool(cfg.end_episode_on_zero_energy)
+
+        self.energy = self.initial_energy
+        self.energy_sum = 0.0
+
         self.rng = random.Random(seed)
         self.action_permutation = [0, 1, 2, 3]
         self.observation_permutation = list(range(self.obs_size))
@@ -291,6 +307,8 @@ class GridWorld:
         self.food_eaten = 0
         self.steps_alive = 0
         self.episode_return = 0.0
+        self.energy = self.initial_energy
+        self.energy_sum = self.energy
 
         for x, y in world_spec.food1_positions:
             self.grid[y][x] = FOOD1
@@ -444,6 +462,8 @@ class GridWorld:
         self.food_eaten = 0
         self.steps_alive = 0
         self.episode_return = 0.0
+        self.energy = self.initial_energy
+        self.energy_sum = self.energy
 
         self.agent_pos = self._random_empty_cell()
         ax, ay = self.agent_pos
@@ -468,9 +488,14 @@ class GridWorld:
         ny = ay + dy
 
         done = False
+        death_by_starvation = False
 
         self.steps_alive += 1
         reward = 0.0
+
+        # survival cost every step
+        if self.use_survival:
+            self.energy -= self.step_energy_cost
 
         if 0 <= nx < self.width and 0 <= ny < self.height:
             target_tile = self.grid[ny][nx]
@@ -484,11 +509,17 @@ class GridWorld:
                 reward += delta
                 ate_food1 = True
 
+                if self.use_survival:
+                    self.energy += max(0.0, self.food1_energy)
+
             elif target_tile == FOOD2:
                 self.food_eaten += 1
                 delta = self.food2_energy
                 reward += delta
                 ate_food2 = True
+
+                if self.use_survival:
+                    self.energy += max(0.0, self.food2_energy)
 
             self.grid[ay][ax] = EMPTY
             self.agent_pos = (nx, ny)
@@ -499,16 +530,30 @@ class GridWorld:
             elif ate_food2:
                 self._respawn_food(FOOD2)
 
-        done = self.steps_alive >= self.episode_horizon
+        if self.use_survival:
+            self.energy = min(self.energy, self.max_energy)
+
+            if self.end_episode_on_zero_energy and self.energy <= 0.0:
+                done = True
+                death_by_starvation = True
+
+            self.energy_sum += self.energy
+
+        if self.steps_alive >= self.episode_horizon:
+            done = True
 
         self.episode_return += reward
 
         self.recompute_corner_smells()
         obs = self.get_observation()
+        avg_energy = self.energy_sum / max(self.steps_alive + 1, 1)
         info = {
             "food_eaten": self.food_eaten,
             "steps_alive": self.steps_alive,
             "episode_return": self.episode_return,
+            "energy": self.energy,
+            "avg_energy": avg_energy,
+            "death_by_starvation": death_by_starvation,
         }
         return obs, reward, done, info
 
@@ -867,8 +912,10 @@ class RunLogger:
                 "world_id",
                 "episode_in_world",
                 "reward",
-                "food_eaten",
+                "final_energy",
+                "avg_energy",
                 "steps_alive",
+                "death_by_starvation",
                 "update_index",
             ])
 
@@ -901,6 +948,7 @@ class RunLogger:
                 to_world_id,
                 update_index,
             ])
+
     def log_episode(
             self,
             episode: int,
@@ -908,8 +956,10 @@ class RunLogger:
             world_id: int,
             episode_in_world: int,
             reward: float,
-            food_eaten: int,
+            final_energy: float,
+            avg_energy: float,
             steps_alive: int,
+            death_by_starvation: bool,
             update_index: int,
     ):
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
@@ -920,8 +970,10 @@ class RunLogger:
                 world_id,
                 episode_in_world,
                 reward,
-                food_eaten,
+                final_energy,
+                avg_energy,
                 steps_alive,
+                int(death_by_starvation),
                 update_index,
             ])
 # ============================================================
@@ -966,7 +1018,7 @@ class PPOTrainer:
         self.buffer = RolloutBuffer()
         self.episodes_per_world = [0 for _ in self.training_worlds]
         self.episode_count = 0
-        self.best_episode_food = -1
+        self.best_episode_avg_energy = -1
 
         self.gradient_step_count = 0
 
@@ -1037,7 +1089,7 @@ class PPOTrainer:
     def _finish_episode_and_log(self, info):
         self.episode_count += 1
         self.episodes_per_world[self.current_world_idx] += 1
-        self.best_episode_food = max(self.best_episode_food, int(info["food_eaten"]))
+        self.best_episode_avg_energy = max(self.best_episode_avg_energy, float(info["avg_energy"]))
 
         if self.logger is not None:
             self.logger.log_episode(
@@ -1046,8 +1098,10 @@ class PPOTrainer:
                 world_id=int(self._current_world().world_id),
                 episode_in_world=self.episodes_per_world[self.current_world_idx],
                 reward=float(info["episode_return"]),
-                food_eaten=int(info["food_eaten"]),
+                final_energy=float(info["energy"]),
+                avg_energy=float(info["avg_energy"]),
                 steps_alive=int(info["steps_alive"]),
+                death_by_starvation=bool(info["death_by_starvation"]),
                 update_index=self.current_update_index,
             )
 
@@ -1312,7 +1366,7 @@ class PPOTrainer:
                     f"F1 {current_world.food1_energy:6.2f} | "
                     f"F2 {current_world.food2_energy:6.2f} | "
                     f"Episodes {self.episode_count:5d} | "
-                    f"BestFood {self.best_episode_food:3d} | "
+                    f"BestAvgEnergy {self.best_episode_avg_energy:6.2f} | "
                     f"PolicyLoss {stats['policy_loss']:.4f} | "
                     f"ValueLoss {stats['value_loss']:.4f} | "
                     f"Entropy {stats['entropy']:.4f} | "
@@ -1406,7 +1460,7 @@ def run_experiment(
     print(f"[{run_name}] Steps per world: {ppo_cfg.steps_per_world}")
 
     trainer.train(render=False)
-    trainer.save(f"{run_name}.pt")
+    trainer.save(os.path.join("grid_runs", f"{run_name}.pt"))
 # ============================================================
 # Main
 # ============================================================
@@ -1423,30 +1477,59 @@ def main():
         episode_horizon=200,
     )
 
-    training_worlds = generate_training_worlds(
-        cfg=env_cfg,
-        num_worlds=NUM_TRAIN_WORLDS,
-        E=GLOBAL_ENERGY_E,
-        seed=TRAIN_WORLD_SEED,
-    )
-
     jobs = [
-        ("ppo", False, False, 1),
-        ("ppo_l2", True, False, 1),
-        ("ppo_cb", False, True, 1),
-        ("ppo_l2_cb", True, True, 1),
+        ("ppo", False, False),
+        ("ppo_l2", True, False),
+        ("ppo_cb", False, True),
+        ("ppo_l2_cb", True, True),
     ]
 
-    processes = []
-    for run_name, use_l2, use_cb, seed in jobs:
-        p = Process(target=run_experiment, args=(run_name, use_l2, use_cb, seed, training_worlds))
-        p.start()
-        processes.append(p)
+    num_trials = 10
+    base_seed = 1
 
-    for p in processes:
-        p.join()
+    for trial_idx in range(num_trials):
+        trial_num = trial_idx + 1
+        print(f"\n==============================")
+        print(f"Starting trial {trial_num}/{num_trials}")
+        print(f"==============================\n")
 
-    print("All training experiments finished.")
+        # Make a separate world set for this trial.
+        # All 4 methods in the same trial get the SAME worlds.
+        training_worlds = generate_training_worlds(
+            cfg=env_cfg,
+            num_worlds=NUM_TRAIN_WORLDS,
+            E=GLOBAL_ENERGY_E,
+            seed=TRAIN_WORLD_SEED + trial_idx,
+        )
+
+        processes = []
+
+        for method_name, use_l2, use_cb in jobs:
+            seed = base_seed + trial_idx
+            run_name = f"{method_name}_trial_{trial_num:02d}"
+
+            p = Process(
+                target=run_experiment,
+                args=(run_name, use_l2, use_cb, seed, training_worlds),
+            )
+            p.start()
+            processes.append((run_name, p))
+
+        # Wait for all 4 methods in this trial to finish
+        failed = []
+        for run_name, p in processes:
+            p.join()
+            if p.exitcode != 0:
+                failed.append((run_name, p.exitcode))
+
+        if failed:
+            print(f"\nTrial {trial_num} finished with failures:")
+            for run_name, exitcode in failed:
+                print(f"  {run_name}: exit code {exitcode}")
+        else:
+            print(f"\nTrial {trial_num} complete: all 4 methods finished successfully.")
+
+    print("\nAll trials finished.")
 
 
 
