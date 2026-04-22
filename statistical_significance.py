@@ -381,6 +381,131 @@ def run_gap_growth_tests(
     print("=" * 80)
     print()
 
+def collect_method_early_late_stats(
+    method,
+    num_trials=NUM_TRIALS,
+    runs_dir=RUNS_DIR,
+    value_col="avg_energy_smooth",
+    grid_points=GRID_POINTS,
+):
+    rows = []
+
+    for trial_idx in range(1, num_trials + 1):
+        run_name = trial_run_name(method, trial_idx)
+        path = os.path.join(runs_dir, f"{run_name}_episodes.csv")
+
+        if not os.path.exists(path):
+            print(f"[WARN] Missing {path}")
+            continue
+
+        df = load_episode_data(run_name, runs_dir=runs_dir)
+        x, y = interpolate_single_trial(df, value_col=value_col, grid_points=grid_points)
+
+        early_mask = x <= EARLY_FRACTION
+        late_mask = x >= (1.0 - LATE_FRACTION)
+
+        early_mean = float(np.mean(y[early_mask]))
+        late_mean = float(np.mean(y[late_mask]))
+        change = late_mean - early_mean
+
+        fit = fit_slope(x, y)
+
+        rows.append({
+            "trial_idx": trial_idx,
+            "run_name": run_name,
+            "early_mean": early_mean,
+            "late_mean": late_mean,
+            "late_minus_early": change,
+            "slope": fit["slope"],
+            "intercept": fit["intercept"],
+            "r": fit["r"],
+            "per_trial_regression_p": fit["p"],
+        })
+
+    return pd.DataFrame(rows).sort_values("trial_idx").reset_index(drop=True)
+
+
+def run_trajectory_decomposition_tests(
+    method_a=METHOD_A,
+    method_b=METHOD_B,
+    runs_dir=RUNS_DIR,
+    value_col="avg_energy_smooth",
+):
+    df_a = collect_method_early_late_stats(
+        method=method_a,
+        runs_dir=runs_dir,
+        value_col=value_col,
+    )
+    df_b = collect_method_early_late_stats(
+        method=method_b,
+        runs_dir=runs_dir,
+        value_col=value_col,
+    )
+
+    merged = pd.merge(
+        df_a,
+        df_b,
+        on="trial_idx",
+        suffixes=(f"_{method_a}", f"_{method_b}")
+    ).dropna()
+
+    early_a = merged[f"early_mean_{method_a}"].to_numpy(dtype=float)
+    late_a = merged[f"late_mean_{method_a}"].to_numpy(dtype=float)
+    change_a = merged[f"late_minus_early_{method_a}"].to_numpy(dtype=float)
+    slope_a = merged[f"slope_{method_a}"].to_numpy(dtype=float)
+
+    early_b = merged[f"early_mean_{method_b}"].to_numpy(dtype=float)
+    late_b = merged[f"late_mean_{method_b}"].to_numpy(dtype=float)
+    change_b = merged[f"late_minus_early_{method_b}"].to_numpy(dtype=float)
+    slope_b = merged[f"slope_{method_b}"].to_numpy(dtype=float)
+
+    change_diff = change_b - change_a
+    slope_diff = slope_b - slope_a
+
+    print("=" * 80)
+    print("Trajectory decomposition analysis")
+    print()
+
+    print(f"{method_a}:")
+    print(f"  early mean = {np.mean(early_a):.6f} ± {np.std(early_a, ddof=1):.6f}")
+    print(f"  late mean  = {np.mean(late_a):.6f} ± {np.std(late_a, ddof=1):.6f}")
+    print(f"  late - early = {np.mean(change_a):.6f} ± {np.std(change_a, ddof=1):.6f}")
+    t_a = stats.ttest_rel(late_a, early_a)
+    print(f"  paired t-test (late vs early): t = {t_a.statistic:.6f}, p = {t_a.pvalue:.6g}")
+    print(f"  mean slope = {np.mean(slope_a):.6f} ± {np.std(slope_a, ddof=1):.6f}")
+    slope_a_test = stats.ttest_1samp(slope_a, popmean=0.0)
+    print(f"  one-sample t-test on slope: t = {slope_a_test.statistic:.6f}, p = {slope_a_test.pvalue:.6g}")
+    print()
+
+    print(f"{method_b}:")
+    print(f"  early mean = {np.mean(early_b):.6f} ± {np.std(early_b, ddof=1):.6f}")
+    print(f"  late mean  = {np.mean(late_b):.6f} ± {np.std(late_b, ddof=1):.6f}")
+    print(f"  late - early = {np.mean(change_b):.6f} ± {np.std(change_b, ddof=1):.6f}")
+    t_b = stats.ttest_rel(late_b, early_b)
+    print(f"  paired t-test (late vs early): t = {t_b.statistic:.6f}, p = {t_b.pvalue:.6g}")
+    print(f"  mean slope = {np.mean(slope_b):.6f} ± {np.std(slope_b, ddof=1):.6f}")
+    slope_b_test = stats.ttest_1samp(slope_b, popmean=0.0)
+    print(f"  one-sample t-test on slope: t = {slope_b_test.statistic:.6f}, p = {slope_b_test.pvalue:.6g}")
+    print()
+
+    print(f"Difference in improvement ({method_b} - {method_a}):")
+    print(f"  change difference = {np.mean(change_diff):.6f} ± {np.std(change_diff, ddof=1):.6f}")
+    change_diff_test = stats.ttest_1samp(change_diff, popmean=0.0)
+    print(f"  one-sample t-test on (late-early) difference: t = {change_diff_test.statistic:.6f}, p = {change_diff_test.pvalue:.6g}")
+
+    print(f"  slope difference = {np.mean(slope_diff):.6f} ± {np.std(slope_diff, ddof=1):.6f}")
+    slope_diff_test = stats.ttest_1samp(slope_diff, popmean=0.0)
+    print(f"  one-sample t-test on slope difference: t = {slope_diff_test.statistic:.6f}, p = {slope_diff_test.pvalue:.6g}")
+    print()
+
+    print("Per-trial decomposition:")
+    print(merged[[
+        "trial_idx",
+        f"early_mean_{method_a}", f"late_mean_{method_a}", f"late_minus_early_{method_a}", f"slope_{method_a}",
+        f"early_mean_{method_b}", f"late_mean_{method_b}", f"late_minus_early_{method_b}", f"slope_{method_b}",
+    ]].to_string(index=False))
+    print("=" * 80)
+    print()
 
 if __name__ == "__main__":
     df_ppo = collect_trial_metrics(METHOD_A)
@@ -402,6 +527,12 @@ if __name__ == "__main__":
 
     # Added time-dependent gap-growth tests
     run_gap_growth_tests(
+        method_a=METHOD_A,
+        method_b=METHOD_B,
+        value_col="avg_energy_smooth",
+    )
+
+    run_trajectory_decomposition_tests(
         method_a=METHOD_A,
         method_b=METHOD_B,
         value_col="avg_energy_smooth",

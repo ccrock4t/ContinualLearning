@@ -4,16 +4,39 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 RUNS_DIR = "grid_runs"
-METHODS = ["ppo", "ppo_l2_cb"]   # or ["ppo", "ppo_l2", "ppo_cb", "ppo_l2_cb"]
+METHODS = ["ppo", "ppo_cb"]
 
 NUM_TRIALS = 10
 SMOOTH_WINDOW = 20
 SHOW_WORLD_SWITCHES = True
-SHOW_ERROR_BAND = True   # mean ± SEM
+SHOW_ERROR_BAND = True
+
+# One-column paper style
+FIG_WIDTH = 3.5
+FIG_HEIGHT = 2.4
+LINEWIDTH = 2.0
+AXIS_LABEL_SIZE = 9
+Y_LABEL_SIZE = 8
+TITLE_SIZE = 9
+TICK_SIZE = 8
+LEGEND_SIZE = 7
+WORLD_SWITCH_WIDTH = 0.8
+SAVE_DPI = 300
+SHOW_TITLE = False   # better for paper figures; describe in caption instead
 
 
 def trial_run_name(method, trial_idx):
     return f"{method}_trial_{trial_idx:02d}"
+
+
+def pretty_method_name(method):
+    mapping = {
+        "ppo": "PPO",
+        "ppo_cb": "PPO+CB",
+        "ppo_l2": r"PPO+$L_2$",
+        "ppo_l2_cb": r"PPO+$L_2$+CB",
+    }
+    return mapping.get(method, method)
 
 
 def load_episode_data(run_name, runs_dir=RUNS_DIR):
@@ -75,25 +98,28 @@ def interpolate_trials(dfs, value_col, grid_points=1000):
         y_interp = np.interp(common_x, x, y)
         y_interp[common_x < x[0]] = np.nan
         y_interp[common_x > x[-1]] = np.nan
-
         Y.append(y_interp)
 
-    Y = np.vstack(Y)
-    return common_x, Y
+    return common_x, np.vstack(Y)
+
+
+def apply_paper_style(ax):
+    ax.tick_params(axis="both", labelsize=TICK_SIZE, width=1.0, length=3, pad=2)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
 
 
 def plot_metric_across_trials(
     methods,
     metric_col,
     smooth_col=None,
-    ylabel="",
+    ylabel="Avg. energy",
     title="",
     runs_dir=RUNS_DIR,
     num_trials=NUM_TRIALS,
     grid_points=1000,
 ):
-    plt.figure(figsize=(12, 6))
-
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
     world_switch_drawn = False
 
     for method in methods:
@@ -107,92 +133,45 @@ def plot_metric_across_trials(
         n_y = np.sum(~np.isnan(Y), axis=0)
         sem_y = std_y / np.sqrt(np.maximum(n_y, 1))
 
-        label = f"{method} (moving average, window={SMOOTH_WINDOW})" if smooth_col is not None else method
-        plt.plot(common_x, mean_y, linewidth=2.5, label=label)
+        ax.plot(common_x, mean_y, linewidth=LINEWIDTH, label=pretty_method_name(method))
 
         if SHOW_ERROR_BAND:
-            plt.fill_between(
-                common_x,
-                mean_y - sem_y,
-                mean_y + sem_y,
-                alpha=0.2,
-            )
+            ax.fill_between(common_x, mean_y - sem_y, mean_y + sem_y, alpha=0.18)
 
         if SHOW_WORLD_SWITCHES and not world_switch_drawn:
             wc = load_world_change_data(trial_run_name(method, 1), runs_dir=runs_dir)
             if wc is not None and len(wc) > 0:
                 for i, (_, row) in enumerate(wc.iterrows()):
-                    plt.axvline(
+                    ax.axvline(
                         row["env_step"],
                         color="black",
                         linestyle="--",
-                        linewidth=1.0,
-                        alpha=0.5,
+                        linewidth=WORLD_SWITCH_WIDTH,
+                        alpha=0.35,
                         label="World switch" if i == 0 else None,
                     )
                 world_switch_drawn = True
 
-    plot_title = title
-    if smooth_col is not None:
-        plot_title += f" (moving average, window={SMOOTH_WINDOW})"
+    ax.set_xlabel("Env. steps", fontsize=AXIS_LABEL_SIZE, fontweight="bold", labelpad=2)
+    ax.set_ylabel(ylabel, fontsize=Y_LABEL_SIZE, fontweight="bold", labelpad=2)
 
-    plt.xlabel("Environment steps")
-    plt.ylabel(ylabel)
-    plt.title(plot_title)
-    plt.legend()
-    plt.tight_layout()
+    if SHOW_TITLE:
+        ax.set_title(title, fontsize=TITLE_SIZE, fontweight="bold", pad=4)
 
-    safe_name = ylabel.lower().replace(" ", "_")
-    plt.savefig(f"{safe_name}_avg_10_trials.pdf", format="pdf", bbox_inches="tight")
-    plt.show()
+    leg = ax.legend(
+        fontsize=LEGEND_SIZE,
+        frameon=False,
+        loc="best",
+        handlelength=1.8,
+        borderaxespad=0.2,
+    )
 
+    apply_paper_style(ax)
 
-def plot_single_method_average_with_world_switches(
-    method,
-    metric_col="avg_energy",
-    smooth_col="avg_energy_smooth",
-    runs_dir=RUNS_DIR,
-    num_trials=NUM_TRIALS,
-    grid_points=1000,
-):
-    dfs = get_method_trial_dfs(method, num_trials=num_trials, runs_dir=runs_dir)
-    value_col = smooth_col if smooth_col is not None else metric_col
+    fig.tight_layout(pad=0.4)
 
-    common_x, Y = interpolate_trials(dfs, value_col=value_col, grid_points=grid_points)
-    mean_y = np.nanmean(Y, axis=0)
-    std_y = np.nanstd(Y, axis=0)
-    n_y = np.sum(~np.isnan(Y), axis=0)
-    sem_y = std_y / np.sqrt(np.maximum(n_y, 1))
-
-    wc = load_world_change_data(trial_run_name(method, 1), runs_dir=runs_dir)
-
-    plt.figure(figsize=(12, 6))
-
-    label = f"{method} mean ({num_trials} trials, window={SMOOTH_WINDOW})" if smooth_col is not None else f"{method} mean ({num_trials} trials)"
-    plt.plot(common_x, mean_y, linewidth=2.5, label=label)
-
-    if SHOW_ERROR_BAND:
-        plt.fill_between(common_x, mean_y - sem_y, mean_y + sem_y, alpha=0.2, label="± SEM")
-
-    if SHOW_WORLD_SWITCHES and wc is not None and len(wc) > 0:
-        for i, (_, row) in enumerate(wc.iterrows()):
-            plt.axvline(
-                row["env_step"],
-                linestyle="--",
-                color="black",
-                alpha=0.5,
-                label="World switch" if i == 0 else None,
-            )
-
-    plot_title = f"{method}: average over {num_trials} trials"
-    if smooth_col is not None:
-        plot_title += f" (moving average, window={SMOOTH_WINDOW})"
-
-    plt.xlabel("Environment steps")
-    plt.ylabel("Average energy")
-    plt.title(plot_title)
-    plt.legend()
-    plt.tight_layout()
+    safe_name = ylabel.lower().replace(" ", "_").replace(".", "")
+    fig.savefig(f"{safe_name}_avg_10_trials.pdf", format="pdf", bbox_inches="tight", dpi=SAVE_DPI)
     plt.show()
 
 
@@ -201,9 +180,6 @@ if __name__ == "__main__":
         METHODS,
         metric_col="avg_energy",
         smooth_col="avg_energy_smooth",
-        ylabel="Average energy per episode",
+        ylabel="Avg. energy",
         title="Average energy vs environment steps",
     )
-
-    for method in METHODS:
-        plot_single_method_average_with_world_switches(method)
