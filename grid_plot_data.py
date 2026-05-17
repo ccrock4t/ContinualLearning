@@ -7,7 +7,7 @@ RUNS_DIR = "grid_runs"
 METHODS = ["ppo", "ppo_cb"]
 
 NUM_TRIALS = 10
-SMOOTH_WINDOW = 20
+SMOOTH_WINDOW = 1000
 SHOW_WORLD_SWITCHES = True
 SHOW_ERROR_BAND = True
 
@@ -43,7 +43,7 @@ def load_episode_data(run_name, runs_dir=RUNS_DIR):
     path = os.path.join(runs_dir, f"{run_name}_episodes.csv")
     df = pd.read_csv(path)
     df = df.sort_values("env_step").reset_index(drop=True)
-
+    df["steps_alive_smooth"] = df["steps_alive"].rolling(SMOOTH_WINDOW, min_periods=1).mean()
     df["reward_smooth"] = df["reward"].rolling(SMOOTH_WINDOW, min_periods=1).mean()
     df["final_energy_smooth"] = df["final_energy"].rolling(SMOOTH_WINDOW, min_periods=1).mean()
     df["avg_energy_smooth"] = df["avg_energy"].rolling(SMOOTH_WINDOW, min_periods=1).mean()

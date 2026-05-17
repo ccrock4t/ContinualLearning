@@ -52,7 +52,7 @@ WALL = 4
 # ============================================================
 
 GLOBAL_ENERGY_E = 20.0
-NUM_TRAIN_WORLDS = 40
+NUM_TRAIN_WORLDS = 80
 TRAIN_WORLD_SEED = 123
 
 
@@ -113,8 +113,6 @@ class NetworkConfig:
 @dataclass
 class PPOConfig:
     total_env_steps_target: int = 1_000_000
-
-    # PPO collection/update cadence
     steps_per_update: int = 2048
     ppo_epochs: int = 10
     minibatch_size: int = 256
@@ -127,7 +125,6 @@ class PPOConfig:
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
 
-    # Continual-learning schedule
     steps_per_world: int = 20_000
 
     use_l2_regularization: bool = False
@@ -137,6 +134,11 @@ class PPOConfig:
     cbp_decay: float = 0.99
     cbp_reinit_fraction: float = 1e-4
     cbp_min_steps_before_reinit: int = 0
+
+    # NEW: activation/plasticity diagnostics
+    activation_log_every_updates: int = 10
+    activation_sample_size: int = 2048
+    dormant_threshold: float = 0.01
 
     device: str = "cpu"
     seed: int = 1
@@ -205,11 +207,13 @@ def generate_training_worlds(
     worlds = []
 
     for i in range(num_worlds):
+        small_coeff = rng.uniform(-0.1, 0.1)
+
         if i % 2 == 0:
             food1_energy = E
-            food2_energy = 0.1*E
+            food2_energy = small_coeff * E
         else:
-            food1_energy = 0.1*E
+            food1_energy = small_coeff * E
             food2_energy = E
 
         spec = generate_world_spec(
@@ -510,7 +514,7 @@ class GridWorld:
                 ate_food1 = True
 
                 if self.use_survival:
-                    self.energy += max(0.0, self.food1_energy)
+                    self.energy += self.food1_energy
 
             elif target_tile == FOOD2:
                 self.food_eaten += 1
@@ -519,7 +523,7 @@ class GridWorld:
                 ate_food2 = True
 
                 if self.use_survival:
-                    self.energy += max(0.0, self.food2_energy)
+                    self.energy += self.food2_energy
 
             self.grid[ay][ax] = EMPTY
             self.agent_pos = (nx, ny)
@@ -758,14 +762,45 @@ class ActorCritic(nn.Module):
                 nonlinearity="relu" if self.activation_name == "relu" else "linear",
             )
             layer.bias[neuron_idx] = 0.0
-    def effective_rank(matrix: torch.Tensor):
+    @staticmethod
+    def effective_rank(matrix: torch.Tensor) -> float:
+        """
+        Entropy-based effective rank of a representation matrix.
+        Higher means more diverse activations.
+        """
+        if matrix.ndim != 2 or matrix.shape[0] < 2:
+            return 0.0
+
+        matrix = matrix - matrix.mean(dim=0, keepdim=True)
         s = torch.linalg.svdvals(matrix)
         s = s[s > 1e-12]
+
         if s.numel() == 0:
             return 0.0
+
         p = s / s.sum()
-        entropy = -(p * torch.log(p)).sum()
+        entropy = -(p * torch.log(p + 1e-12)).sum()
         return float(torch.exp(entropy).item())
+
+    @staticmethod
+    def stable_rank_99(matrix: torch.Tensor) -> float:
+        """
+        Number of singular values needed to explain 99% of singular-value mass.
+        This tracks the paper's representation-diversity diagnostic.
+        """
+        if matrix.ndim != 2 or matrix.shape[0] < 2:
+            return 0.0
+
+        matrix = matrix - matrix.mean(dim=0, keepdim=True)
+        s = torch.linalg.svdvals(matrix)
+        s = s[s > 1e-12]
+
+        if s.numel() == 0:
+            return 0.0
+
+        frac = torch.cumsum(s, dim=0) / s.sum()
+        k = int(torch.searchsorted(frac, torch.tensor(0.99, device=s.device)).item()) + 1
+        return float(k)
 
     def zero_outgoing_to_neuron_in_next_layer(self, hidden_layer_idx: int, neuron_idx: int):
         with torch.no_grad():
@@ -931,6 +966,57 @@ class RunLogger:
                 "update_index",
             ])
 
+        self.activation_path = os.path.join(run_dir, f"{base}_activations.csv")
+
+        with open(self.activation_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "run_name",
+                "update_index",
+                "env_step",
+                "world_id",
+                "layer_idx",
+                "mean_abs_activation",
+                "mean_activation",
+                "std_activation",
+                "dormant_fraction",
+                "effective_rank",
+                "stable_rank_99",
+                "num_reinitialized_total",
+            ])
+
+    def log_activation_metrics(
+        self,
+        run_name: str,
+        update_index: int,
+        env_step: int,
+        world_id: int,
+        layer_idx: int,
+        mean_abs_activation: float,
+        mean_activation: float,
+        std_activation: float,
+        dormant_fraction: float,
+        effective_rank: float,
+        stable_rank_99: float,
+        num_reinitialized_total: int,
+    ):
+        with open(self.activation_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                run_name,
+                update_index,
+                env_step,
+                world_id,
+                layer_idx,
+                mean_abs_activation,
+                mean_activation,
+                std_activation,
+                dormant_fraction,
+                effective_rank,
+                stable_rank_99,
+                num_reinitialized_total,
+            ])
+
     def log_world_change(
             self,
             episode: int,
@@ -1021,6 +1107,7 @@ class PPOTrainer:
         self.best_episode_avg_energy = -1
 
         self.gradient_step_count = 0
+        self.num_reinitialized_total = 0
 
         # One EMA utility vector per hidden layer
         self.hidden_utilities = []
@@ -1044,6 +1131,67 @@ class PPOTrainer:
             world_spec=self.training_worlds[self.current_world_idx]
         )
 
+    def _sample_recent_observations_for_activation_metrics(self):
+        """
+        Uses the most recent rollout buffer as a representative sample.
+        """
+        if len(self.buffer.obs) == 0:
+            return None
+
+        obs_np = np.array(self.buffer.obs, dtype=np.float32)
+        n = obs_np.shape[0]
+        sample_n = min(self.cfg.activation_sample_size, n)
+
+        if sample_n < n:
+            idx = np.random.choice(n, size=sample_n, replace=False)
+            obs_np = obs_np[idx]
+
+        return obs_np
+
+    def log_activation_metrics(self):
+        if self.logger is None:
+            return
+
+        obs_np = self._sample_recent_observations_for_activation_metrics()
+        if obs_np is None:
+            return
+
+        x = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            _ = self.model.forward(x)
+            acts = self.model.last_hidden_activations
+
+        current_world = self._current_world()
+
+        for layer_idx, a in enumerate(acts):
+            # a shape: [batch, units]
+            mean_abs_per_unit = a.abs().mean(dim=0)
+            dormant_fraction = float(
+                (mean_abs_per_unit < self.cfg.dormant_threshold).float().mean().item()
+            )
+
+            mean_abs_activation = float(a.abs().mean().item())
+            mean_activation = float(a.mean().item())
+            std_activation = float(a.std().item())
+
+            effective_rank = self.model.effective_rank(a)
+            stable_rank_99 = self.model.stable_rank_99(a)
+
+            self.logger.log_activation_metrics(
+                run_name=self.logger.run_name,
+                update_index=self.current_update_index,
+                env_step=self.total_env_steps,
+                world_id=int(current_world.world_id),
+                layer_idx=layer_idx,
+                mean_abs_activation=mean_abs_activation,
+                mean_activation=mean_activation,
+                std_activation=std_activation,
+                dormant_fraction=dormant_fraction,
+                effective_rank=effective_rank,
+                stable_rank_99=stable_rank_99,
+                num_reinitialized_total=int(self.num_reinitialized_total),
+            )
 
     def measure_dormant_fraction(self, sample_obs: np.ndarray, threshold: float = 0.01):
         x = torch.tensor(sample_obs, dtype=torch.float32, device=self.device)
@@ -1184,6 +1332,8 @@ class PPOTrainer:
                 self.hidden_ages[layer_idx][neuron_idx] = 0
 
                 self._clear_optimizer_state_for_neuron(layer_idx, neuron_idx)
+
+                self.num_reinitialized_total += 1
 
     def _clear_optimizer_state_for_neuron(self, hidden_layer_idx: int, neuron_idx: int):
         layer = self.model.hidden_linears[hidden_layer_idx]
@@ -1353,6 +1503,8 @@ class PPOTrainer:
                 render_every=1,
             )
             stats = self.update()
+            if update % self.cfg.activation_log_every_updates == 0 or update == 1:
+                self.log_activation_metrics()
 
             if update % 10 == 0 or update == 1:
                 avg_w = self.average_weight_magnitude()
@@ -1487,7 +1639,10 @@ def main():
     num_trials = 10
     base_seed = 1
 
-    for trial_idx in range(num_trials):
+    start_trial = 1  # human-readable trial number
+    end_trial_inclusive  = num_trials  # human-readable trial number, inclusive
+
+    for trial_idx in range(start_trial - 1, end_trial_inclusive):
         trial_num = trial_idx + 1
         print(f"\n==============================")
         print(f"Starting trial {trial_num}/{num_trials}")
